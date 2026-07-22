@@ -163,15 +163,15 @@ dark site does not get tagged with the observatory's numbers.
 
 ## Web UI (optional)
 
-With `extension.register`, the watcher announces itself to NightWatcher2 and
-heartbeats while it runs, so an **Ingest** tab appears in the NightWatcher2 web
-UI showing recent activity. Stop the watcher and the tab goes away. NightWatcher2
-itself stays a clean standalone SQM tool; this is an optional extension it lights
-up only when the tool is present.
+With `extension.register`, the watcher registers with NightWatcher2 and heartbeats
+while it runs, so an **Ingest** tab appears in the web UI showing the transfer
+history from `ingest_log` (each filed frame: time, target, rig, filter, SQM,
+destination, status). Stop the watcher and the tab goes away.
 
-The watcher side is in place: it fills `ingest_log` and maintains its row in the
-`extensions` registry (both tables auto-created). Rendering the tab is done by
-NightWatcher2 and is the next piece of work.
+With `events.enabled` (default on), each transfer is also written to NightWatcher's
+shared `events` table, so it shows up in the **Events** tab next to the daemon's
+own events — a one-line audit per frame. NightWatcher2 itself stays a clean
+standalone SQM tool; this is an optional extension it lights up only when present.
 
 ## Status
 

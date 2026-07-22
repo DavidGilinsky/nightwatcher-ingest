@@ -125,6 +125,12 @@ extension:
   label: Ingest
   heartbeat_seconds: 20         # min seconds between heartbeats (advisory)
 
+# --- log each filed frame to the NightWatcher `events` table (needs `nwdb`) ---
+# One row per transfer (source=ingest, event=transfer), so ingest activity shows
+# up in the NightWatcher2 web UI's Events tab alongside the daemon's own events.
+events:
+  enabled: true
+
 logging:
   level: info                 # debug | info | warning | error
   file: null                  # e.g. /var/log/nwingest/nwingest.log (null = stdout only)

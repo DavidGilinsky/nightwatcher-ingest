@@ -119,6 +119,7 @@ DEFAULTS = {
     "hooks": [],
     "extension": {"register": False, "name": "ingest", "label": "Ingest",
                   "heartbeat_seconds": 20},
+    "events": {"enabled": True},
     "logging": {"level": "info", "file": None},
 }
 
@@ -584,6 +585,13 @@ class Nwdb:
              r.get("filter"), r.get("sqm"), r.get("dest"), r.get("status"),
              r.get("detail")))
 
+    def log_event(self, source, level, event, detail, device_id=""):
+        """Append a row to the daemon's shared `events` table (shows in the Events tab)."""
+        self._exec(
+            "INSERT INTO events (ts_utc, device_id, source, level, event, detail) "
+            "VALUES (UTC_TIMESTAMP(), %s, %s, %s, %s, %s)",
+            (device_id or None, source, level, event, detail or None))
+
     def register(self, ext):
         self._exec(
             "INSERT INTO extensions "
@@ -842,11 +850,19 @@ def process_dir(cfg, fits, db):
                     "sqm": sqm_val, "dest": reldest, "status": action}, db)
             note = f"  SQM={sqm_val}" if sqm_val else ""
             log(f"  {kind:10} {os.path.basename(f)} -> {reldest} [{action}]{note}")
+            if db is not None and cfg.get("events", {}).get("enabled", True):
+                lvl = "warning" if kind == "quarantine" else "info"
+                sensor = next((s.get("sensor", "") for s in cfg["sqm"].get("sites", [])
+                               if s.get("name") == v.get("site")), "")
+                db.log_event("ingest", lvl, "transfer", reldest + note, sensor)
             n += 1
         except Exception as e:
             log(f"  ERROR {os.path.basename(f)}: {e}")
             record({"kind": "error", "dest": os.path.basename(f),
                     "status": "error", "detail": str(e)[:200]}, db)
+            if db is not None and cfg.get("events", {}).get("enabled", True):
+                db.log_event("ingest", "error", "transfer",
+                             f"{os.path.basename(f)}: {str(e)[:180]}")
     return n
 
 
