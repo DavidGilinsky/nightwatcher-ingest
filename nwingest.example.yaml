@@ -86,7 +86,7 @@ sqm:
   provenance: true            # also write SQMSRC, SQMTIME, SQMDT
   max_gap_minutes: 15         # don't stamp if the nearest reading is older than this
   sites:                      # a frame is stamped only if its coordinates match a site
-    - { name: CrestaLoma, lat: 32.303, lon: -110.986, tol_deg: 0.05, sensor: DSN036 }
+    - { name: CrestaLoma, lat: 32.30314, lon: -110.98589, tol_deg: 0.05, sensor: DSN036 }
   nwdb:
     host: 127.0.0.1
     port: 3306

@@ -39,7 +39,7 @@ lights/M57/Askar185-ASI6200/2026-05-22/CLEAR/M57_2026-05-23T102229Z_0055_Askar18
 ## Install
 
 ```sh
-pip install astropy pyyaml          # mysql-connector-python too, if you use the DB features
+pip install astropy pyyaml          # add PyMySQL too if you enable the SQM stamp
 ```
 
 Python 3.9+. `astropy` does the FITS work; `pyyaml` reads the config.
@@ -132,9 +132,10 @@ up only when the tool is present.
 
 ## Status
 
-Early. The config-driven classify/rename/file core and the read-only `plan`
-mode are working. The SQM stamp, the hook runner, the ingest log, and the web UI
-registration are stubbed and being built next.
+The config-driven classify/rename/file core, the read-only `plan` mode, the
+CLEAR filter default, and the **SQM stamp** (site-matched, nearest reading from
+the NightWatcher database, writing `SQM`/`SQMSRC`/`SQMTIME`/`SQMDT`) are working.
+The hook runner, the ingest log, and the web UI registration are stubbed and next.
 
 ## License
 

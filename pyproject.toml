@@ -21,8 +21,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Needed only when sqm.enabled or extension.register is true (nwdb access).
-db = ["mysql-connector-python>=8.0"]
+# Needed only when sqm.enabled (nwdb access). PyMySQL is pure-Python (MIT),
+# so it adds no C client library and no GPL-linking concern.
+db = ["PyMySQL>=1.0"]
 
 [project.scripts]
 nwingest = "nwingest:main"

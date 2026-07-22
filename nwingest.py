@@ -270,15 +270,52 @@ def norm_object(h, cfg):
     return re.sub(r"[^\w+-]", "_", obj)
 
 
+def _parse_coord(val):
+    """Decimal degrees from a numeric or sexagesimal FITS coordinate value."""
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    s = str(val).strip()
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    m = re.match(r"([+-]?)\s*(\d+)[\s:]+(\d+)[\s:]+([\d.]+)", s)   # '+32 18 11.30'
+    if not m:
+        return None
+    sign = -1.0 if m.group(1) == "-" else 1.0
+    return sign * (float(m.group(2)) + float(m.group(3)) / 60 + float(m.group(4)) / 3600)
+
+
+def _frame_coords(h):
+    """(lat, lon) in decimal degrees, preferring the unambiguous OBSGEO cards.
+
+    TheSkyX writes SITELONG sexagesimal with a positive sign for a west longitude
+    (a trap), but also writes OBSGEO-L as a correct signed decimal, so OBSGEO wins.
+    """
+    lat = _parse_coord(hget(h, "OBSGEO-B"))
+    lon = _parse_coord(hget(h, "OBSGEO-L"))
+    if lat is None:
+        lat = _parse_coord(hget(h, "SITELAT", "LAT-OBS", "OBJCTLAT"))
+    if lon is None:
+        lon = _parse_coord(hget(h, "SITELONG", "LONG-OBS", "OBJCTLONG"))
+    return lat, lon
+
+
 def _site_of(h, cfg):
-    # NOTE: numeric SITELAT/SITELONG only for now; sexagesimal strings are a TODO.
-    lat = fnum(h, "SITELAT", "OBSGEO-B")
-    lon = fnum(h, "SITELONG", "OBSGEO-L")
-    if lat is None or lon is None:
+    sites = cfg.get("sqm", {}).get("sites", [])
+    lat, lon = _frame_coords(h)
+    if lat is not None and lon is not None:
+        for s in sites:
+            tol = s.get("tol_deg", 0.05)
+            if abs(lat - s["lat"]) <= tol and abs(lon - s["lon"]) <= tol:
+                return s["name"]
         return ""
-    for s in cfg.get("sqm", {}).get("sites", []):
-        tol = s.get("tol_deg", 0.05)
-        if abs(lat - s["lat"]) <= tol and abs(lon - s["lon"]) <= tol:
+    # no usable coords: fall back to an observatory-name card (NINA writes OBSERVAT)
+    name = str(hget(h, "OBSERVAT", "SITENAME", default="") or "").strip()
+    for s in sites:
+        if name and name.lower() == s["name"].lower():
             return s["name"]
     return ""
 
@@ -310,6 +347,7 @@ def resolve(path, h, cfg):
         "_exp_num": exp,
         "_no_date": dt is None,
         "_filter_defaulted": not raw_filter,
+        "_dt_utc": dt,
     }
 
 
@@ -438,36 +476,103 @@ def _dedupe(dst):
 
 
 # ---------------------------------------------------------------------------
-# Header normalization
+# nwdb access (SQM lookup)
 # ---------------------------------------------------------------------------
-def normalize_filter(path, kind, v, cfg, fits):
-    """Write the default FILTER into a filed light/flat whose header lacked one.
+class Nwdb:
+    """Lazy, reused connection to the NightWatcher database (PyMySQL)."""
 
-    Broadband/no-filter frames often carry no FILTER card; WBPP groups by it,
-    so we set it explicitly (default CLEAR) rather than leaving it blank.
-    """
-    if kind not in ("light", "flat"):
-        return
-    if not v.get("_filter_defaulted"):
-        return
-    if not cfg["resolve"]["filter"].get("write_header", True):
-        return
+    def __init__(self, cfg):
+        self.c = cfg["sqm"].get("nwdb", {})
+        self.conn = None
+
+    def _connect(self):
+        import pymysql
+        pw = os.environ.get(self.c.get("password_env", "NWDB_PASSWORD"), "")
+        self.conn = pymysql.connect(
+            host=self.c.get("host", "127.0.0.1"), port=int(self.c.get("port", 3306)),
+            user=self.c.get("user", "nightwatcher"), password=pw,
+            database=self.c.get("name", "nightwatcher"), autocommit=True,
+            connect_timeout=5)
+
+    def nearest_reading(self, sensor, dt, gap_min):
+        """(ts_utc, mag) for the reading nearest dt within +/- gap_min, else None."""
+        lo, hi = dt - timedelta(minutes=gap_min), dt + timedelta(minutes=gap_min)
+        for attempt in (1, 2):
+            try:
+                if self.conn is None:
+                    self._connect()
+                with self.conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT ts_utc, mag_arcsec2 FROM readings "
+                        "WHERE sensor_id=%s AND ts_utc BETWEEN %s AND %s "
+                        "AND quality<>'saturated' "
+                        "ORDER BY ABS(TIMESTAMPDIFF(SECOND, ts_utc, %s)) LIMIT 1",
+                        (sensor, lo, hi, dt))
+                    return cur.fetchone()
+            except Exception as e:
+                self.conn = None
+                if attempt == 2:
+                    log(f"    warn: nwdb query failed: {e}")
+        return None
+
+    def close(self):
+        if self.conn:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+            self.conn = None
+
+
+def lookup_sqm(v, cfg, db):
+    """Header cards for the SQM reading nearest this light frame, or None."""
+    site, dt = v.get("site"), v.get("_dt_utc")
+    if not site or dt is None or db is None:
+        return None
+    scfg = next((s for s in cfg["sqm"].get("sites", []) if s["name"] == site), None)
+    if not scfg or not scfg.get("sensor"):
+        return None
+    row = db.nearest_reading(scfg["sensor"], dt, cfg["sqm"].get("max_gap_minutes", 15))
+    if not row:
+        return None
+    ts, mag = row[0], float(row[1])
+    kw = cfg["sqm"].get("keyword", "SQM")
+    cards = {kw: (round(mag, 3), "sky brightness mag/arcsec^2 (nwingest)")}
+    if cfg["sqm"].get("provenance", True):
+        cards["SQMSRC"] = (scfg["sensor"], "SQM sensor id")
+        cards["SQMTIME"] = (ts.strftime("%Y-%m-%dT%H:%M:%S"), "SQM reading time (UTC)")
+        cards["SQMDT"] = (int(abs((dt - ts).total_seconds())), "sec between reading and DATE-OBS")
+    return cards
+
+
+# ---------------------------------------------------------------------------
+# Header finalization: FILTER default + SQM stamp, in a single file open
+# ---------------------------------------------------------------------------
+def finalize_header(path, kind, v, cfg, fits, db):
+    edits = {}
+    if (kind in ("light", "flat") and v.get("_filter_defaulted")
+            and cfg["resolve"]["filter"].get("write_header", True)):
+        edits["FILTER"] = (v["filter"], "filled by nwingest (header had none)")
+    if kind == "light" and cfg["sqm"].get("enabled"):
+        sqm = lookup_sqm(v, cfg, db)
+        if sqm:
+            edits.update(sqm)
+    if not edits:                       # nothing to write: don't rewrite the file
+        return None
     try:
-        fits.setval(path, "FILTER", value=v["filter"],
-                    comment="filled by nwingest (header had none)")
+        with fits.open(path, mode="update") as hdul:
+            hdr = hdul[0].header
+            for k, (val, comment) in edits.items():
+                hdr[k] = (val, comment)
+        return edits
     except Exception as e:
-        log(f"    warn: could not set FILTER on {os.path.basename(path)}: {e}")
+        log(f"    warn: header finalize failed on {os.path.basename(path)}: {e}")
+        return None
 
 
 # ---------------------------------------------------------------------------
-# Stubs for the next build stage (SQM stamp, hooks, DB log, extension registry)
+# Stubs for the next build stage (hooks exec, DB log, extension registry)
 # ---------------------------------------------------------------------------
-def stamp_sqm(path, v, cfg, fits):
-    """TODO: query nwdb for the reading nearest DATE-OBS within max_gap, gated by
-    site-match, and write SQM / SQMSRC / SQMTIME / SQMDT keywords via astropy."""
-    return None
-
-
 def run_hooks(dest, v, cfg):
     """Requirement 5: run configured external programs on the filed file."""
     for hk in cfg.get("hooks", []):
@@ -583,23 +688,28 @@ def process_dir(cfg, fits):
     files = scan(cfg["watch"]["incoming"], cfg, require_stable=True)
     if not files:
         return 0
+    db = Nwdb(cfg) if cfg["sqm"].get("enabled") else None
     n = 0
-    for f in files:
-        try:
-            v, kind, extra = analyze(f, cfg, fits)
-            dest = place_live(f, v, kind, extra, cfg)
-            if cfg["sqm"].get("enabled"):
-                stamp_sqm(f, v, cfg, fits)
-            action, dest = move(f, dest, cfg["destination"]["on_conflict"])
-            normalize_filter(dest, kind, v, cfg, fits)
-            run_hooks(dest, v, cfg)
-            record({"src": f, "dest": dest, "kind": kind,
-                    "object": v.get("object"), "status": action}, cfg)
-            log(f"  {kind:10} {os.path.basename(f)} -> "
-                f"{os.path.relpath(dest, cfg['destination']['root'])} [{action}]")
-            n += 1
-        except Exception as e:
-            log(f"  ERROR {os.path.basename(f)}: {e}")
+    try:
+        for f in files:
+            try:
+                v, kind, extra = analyze(f, cfg, fits)
+                dest = place_live(f, v, kind, extra, cfg)
+                action, dest = move(f, dest, cfg["destination"]["on_conflict"])
+                edits = finalize_header(dest, kind, v, cfg, fits, db)
+                run_hooks(dest, v, cfg)
+                record({"src": f, "dest": dest, "kind": kind,
+                        "object": v.get("object"), "status": action}, cfg)
+                sqm = edits.get(cfg["sqm"].get("keyword", "SQM")) if edits else None
+                note = f"  SQM={sqm[0]}" if sqm else ""
+                log(f"  {kind:10} {os.path.basename(f)} -> "
+                    f"{os.path.relpath(dest, cfg['destination']['root'])} [{action}]{note}")
+                n += 1
+            except Exception as e:
+                log(f"  ERROR {os.path.basename(f)}: {e}")
+    finally:
+        if db:
+            db.close()
     return n
 
 
