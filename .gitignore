@@ -1,0 +1,18 @@
+# Local, secret, or site-specific config (copy nwingest.example.yaml to make one)
+nwingest.yaml
+*.local.yaml
+.env
+secrets/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.venv/
+venv/
+build/
+dist/
+
+# Runtime
+*.log

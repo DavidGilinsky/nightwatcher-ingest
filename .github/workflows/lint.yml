@@ -1,0 +1,19 @@
+name: lint
+on: [push, pull_request]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install lint deps
+        run: pip install pyyaml ruff
+      - name: Byte-compile the script
+        run: python -m py_compile nwingest.py
+      - name: Validate the example config parses
+        run: python -c "import yaml; yaml.safe_load(open('nwingest.example.yaml'))"
+      - name: Ruff (non-blocking style pass)
+        run: ruff check nwingest.py || true

@@ -1,0 +1,120 @@
+# ============================================================================
+#  nwingest example configuration
+#
+#  Copy to /etc/nwingest/nwingest.yaml (or pass --config) and edit.
+#  Anything omitted falls back to the built-in defaults in nwingest.py.
+#
+#  Template variables available in path/filename templates:
+#    {object} {type} {rig} {camera} {night} {filter} {utc} {seq}
+#    {exp} {gain} {offset} {bin} {temp} {site} {source} {reason}
+#  Empty tokens collapse cleanly (a missing {filter} does not leave "__").
+#  The file extension is appended by the tool (see destination.normalize_ext),
+#  so templates do not include it.
+# ============================================================================
+
+watch:
+  incoming: /astronomy/astro-imaging/incoming   # directory to watch (recursive)
+  poll_seconds: 45            # NFS-safe poll interval (inotify can't see other hosts' writes)
+  stable_seconds: 10          # a file must be untouched this long before it's processed
+  patterns: ["*.fits", "*.fit", "*.fts"]
+  ignore: ["_gsdata_", ".tmp", ".part"]         # GoodSync staging, partial writes
+
+destination:
+  root: /astronomy/astro-imaging   # where the archive tree lives
+  normalize_ext: .fits             # force this extension (null = keep original)
+  on_conflict: sequence            # sequence | skip | overwrite
+
+# --- requirements 2 & 3: destination structure and filename, per frame type ---
+routes:
+  light:
+    path:     "lights/{object}/{rig}/{night}/{filter}"
+    filename: "{object}_{utc}Z_{seq}_{rig}_{filter}_{exp}s_g{gain}_o{offset}_bin{bin}_{temp}C"
+  dark:
+    path:     "calibration/dark/{camera}/{exp}s_g{gain}_o{offset}_bin{bin}_{temp}C/{night}"
+    filename: "Dark_{utc}Z_{seq}_{camera}_{exp}s_g{gain}_o{offset}_bin{bin}_{temp}C"
+  flat:
+    path:     "calibration/flat/{rig}/{filter}/{night}"
+    filename: "Flat_{utc}Z_{seq}_{rig}_{filter}_g{gain}_o{offset}_bin{bin}"
+  bias:
+    path:     "calibration/bias/{camera}/g{gain}_o{offset}_bin{bin}/{night}"
+    filename: "Bias_{utc}Z_{seq}_{camera}_g{gain}_o{offset}_bin{bin}"
+  flatdark:
+    path:     "calibration/flatdark/{camera}/{exp}s_g{gain}_o{offset}_bin{bin}/{night}"
+    filename: "FlatDark_{utc}Z_{seq}_{camera}_{exp}s_g{gain}_o{offset}_bin{bin}"
+
+# frames that aren't science: aux (focus/slew/preview) and broken headers
+buckets:
+  review:     "review/{source}"
+  quarantine: "quarantine/{reason}"
+  process:    "process"
+
+# --- how header values become template variables (all customizable) ---
+resolve:
+  night:
+    mode: noon-to-noon        # noon-to-noon | utc-date
+    utc_offset_hours: -7      # observatory local offset (Phoenix = -7, no DST)
+  object:
+    messier_alias: true       # NGC 224 -> M31, etc. (map below / built-in defaults)
+  filter:
+    osc_when_absent: "OSC"    # color cameras (BAYERPAT / *MC*) with no filter wheel
+  gain_keywords: [GAIN, GAINRAW]   # tried in order; TheSkyX writes GAINRAW
+  sequence:
+    width: 4                  # zero-padded per-folder sequence, e.g. 0007
+
+# rigs identified by camera + focal length (TELESCOP is the mount, unreliable)
+rigs:
+  - { camera: ASI6200, focal_mm: [1280, 1310], name: Askar185-ASI6200 }
+  - { camera: ASI2600, focal_mm: [435, 448],   name: WO73A-ASI2600 }
+  - { camera: ASI2600, focal_mm: [512, 525],   name: WOUC108-ASI2600 }
+
+camera_aliases:
+  ASICamera: ASI6200          # TheSkyX's generic camera name -> the real model
+
+# extra NGC->M aliases beyond the built-in set (optional)
+messier:
+  NGC4438: M86
+
+exclude_lights:
+  path_tokens: ["@focus", "autofocus", "closed loop slew", "/slew/", "/preview/", "failed", "platesolve"]
+  min_exposure_s: 30          # shorter "Light" frames are focus/test frames -> review
+
+# --- SQM stamping from NightWatcher (optional; skipped if disabled) ---
+sqm:
+  enabled: false              # turn on once the DB is reachable
+  keyword: SQM                # header keyword written into each stamped frame
+  provenance: true            # also write SQMSRC, SQMTIME, SQMDT
+  max_gap_minutes: 15         # don't stamp if the nearest reading is older than this
+  sites:                      # a frame is stamped only if its coordinates match a site
+    - { name: CrestaLoma, lat: 32.303, lon: -110.986, tol_deg: 0.05, sensor: DSN036 }
+  nwdb:
+    host: 127.0.0.1
+    port: 3306
+    name: nightwatcher
+    user: nightwatcher
+    password_env: NWDB_PASSWORD   # read the password from this environment variable
+
+# --- requirement 5: modular external programs run after a file is filed ---
+# Each hook is a named command template. {dest} is the final path; every
+# resolve variable ({object}, {filter}, {rig}, ...) is also available.
+hooks:
+  - name: plate-solve-lights
+    when: { type: light }         # match conditions on resolved variables
+    run:  "solve-field --overwrite --no-plots {dest}"
+    background: true              # don't block the pipeline
+    timeout_s: 300
+    enabled: false
+  - name: notify-target
+    when: { type: light, object: M31 }
+    run:  "/usr/local/bin/notify.sh {object} {dest}"
+    enabled: false
+
+# --- requirement 6: NightWatcher2 web UI integration (extension registry) ---
+extension:
+  register: false             # register + heartbeat so the "Ingest" tab appears while running
+  name: ingest
+  label: Ingest
+  heartbeat_seconds: 20
+
+logging:
+  level: info                 # debug | info | warning | error
+  file: null                  # e.g. /var/log/nwingest/nwingest.log (null = stdout only)
