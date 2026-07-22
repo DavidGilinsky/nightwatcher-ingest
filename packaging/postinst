@@ -1,0 +1,26 @@
+#!/bin/sh
+# nightwatcher-ingest postinst: create the service account and wire up systemd.
+set -e
+
+case "$1" in
+  configure)
+    # Dedicated, unprivileged system account for the watcher. It needs read
+    # access to the incoming directory and write access to the archive tree;
+    # grant that via group membership or an ACL on your NAS (site-specific).
+    if ! getent passwd nwingest >/dev/null 2>&1; then
+        adduser --system --group --no-create-home --home /nonexistent \
+                --gecos "NightWatcher ingest" nwingest >/dev/null 2>&1 || true
+    fi
+
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl enable nwingest.service >/dev/null 2>&1 || true
+    fi
+
+    echo "nightwatcher-ingest: edit /etc/nwingest/nwingest.yaml (and set NWDB_PASSWORD"
+    echo "  in /etc/nwingest/nwingest.env if you enable the SQM stamp or the web-UI"
+    echo "  extension), then:  sudo systemctl start nwingest"
+    ;;
+esac
+
+exit 0

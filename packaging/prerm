@@ -1,0 +1,14 @@
+#!/bin/sh
+# nightwatcher-ingest prerm: stop and disable the service before removal.
+set -e
+
+case "$1" in
+  remove|deconfigure)
+    if [ -d /run/systemd/system ]; then
+        systemctl stop nwingest.service >/dev/null 2>&1 || true
+        systemctl disable nwingest.service >/dev/null 2>&1 || true
+    fi
+    ;;
+esac
+
+exit 0

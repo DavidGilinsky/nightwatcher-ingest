@@ -1,12 +1,10 @@
 # NightWatcher FITS ingest watcher.
 #
-# Install:
-#   sudo cp nwingest.py /opt/nwingest/nwingest.py
-#   sudo mkdir -p /etc/nwingest && sudo cp nwingest.example.yaml /etc/nwingest/nwingest.yaml
-#   sudo cp systemd/nwingest.service /etc/systemd/system/
-#   sudo systemctl daemon-reload && sudo systemctl enable --now nwingest
-#
-# Watch it:  journalctl -fu nwingest
+# Installed by the nightwatcher-ingest package to /lib/systemd/system/.
+# Configure /etc/nwingest/nwingest.yaml (and set NWDB_PASSWORD in
+# /etc/nwingest/nwingest.env if you enable the SQM stamp or the web-UI
+# extension), then:  sudo systemctl enable --now nwingest
+# Watch it:          journalctl -fu nwingest
 
 [Unit]
 Description=NightWatcher FITS ingest watcher
@@ -15,10 +13,12 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# Run as the account that can read incoming/ and write the archive tree.
+# The service account must read incoming/ and write the archive tree (grant via
+# group membership or an ACL). To run as a different user, add a drop-in:
+#   systemctl edit nwingest   ->   [Service]\nUser=youruser\nGroup=yourgroup
 User=nwingest
 Group=nwingest
-ExecStart=/usr/bin/python3 /opt/nwingest/nwingest.py --config /etc/nwingest/nwingest.yaml watch
+ExecStart=/usr/bin/nwingest --config /etc/nwingest/nwingest.yaml watch
 Restart=on-failure
 RestartSec=10
 # Secrets (e.g. NWDB_PASSWORD=...) live here, not in the unit or the YAML.

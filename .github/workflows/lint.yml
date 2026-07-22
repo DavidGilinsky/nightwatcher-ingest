@@ -17,3 +17,18 @@ jobs:
         run: python -c "import yaml; yaml.safe_load(open('nwingest.example.yaml'))"
       - name: Ruff (non-blocking style pass)
         run: ruff check nwingest.py || true
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the .deb
+        run: sh packaging/build-deb.sh
+      - name: Inspect the package
+        run: |
+          dpkg-deb -I nightwatcher-ingest_*_all.deb
+          dpkg-deb -c nightwatcher-ingest_*_all.deb
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nightwatcher-ingest-deb
+          path: nightwatcher-ingest_*_all.deb

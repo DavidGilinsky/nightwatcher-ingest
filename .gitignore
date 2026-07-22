@@ -16,3 +16,6 @@ dist/
 
 # Runtime
 *.log
+
+# built Debian package
+nightwatcher-ingest_*_all.deb

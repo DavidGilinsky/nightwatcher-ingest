@@ -38,11 +38,29 @@ lights/M57/Askar185-ASI6200/2026-05-22/CLEAR/M57_2026-05-23T102229Z_0055_Askar18
 
 ## Install
 
+**Debian/Ubuntu (recommended)** — build and install the package:
+
+```sh
+make deb
+sudo apt install ./nightwatcher-ingest_0.1.0_all.deb
+```
+
+It installs `nwingest` to `/usr/bin`, a default config to
+`/etc/nwingest/nwingest.yaml`, a `nwingest` systemd service, and pulls in
+`python3-astropy`, `python3-yaml`, and `python3-pymysql`. It creates an
+unprivileged `nwingest` service account (give it read on `incoming/` and write
+on the archive tree via group/ACL). Edit the config, set `NWDB_PASSWORD` in
+`/etc/nwingest/nwingest.env` if you use the DB features, then
+`sudo systemctl enable --now nwingest`.
+
+**From source / other platforms:**
+
 ```sh
 pip install astropy pyyaml          # add PyMySQL too if you enable the SQM stamp
 ```
 
-Python 3.9+. `astropy` does the FITS work; `pyyaml` reads the config.
+Python 3.9+. `astropy` does the FITS work; `pyyaml` reads the config; `PyMySQL`
+is only needed for the SQM stamp and the extension registry.
 
 ## Configure
 

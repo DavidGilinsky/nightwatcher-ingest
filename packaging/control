@@ -1,0 +1,16 @@
+Package: nightwatcher-ingest
+Version: 0.0.0
+Architecture: all
+Maintainer: David Gilinsky <gilinsky@gilinskyresearch.com>
+Depends: python3 (>= 3.9), python3-astropy, python3-yaml, python3-pymysql
+Section: science
+Priority: optional
+Homepage: https://github.com/DavidGilinsky/nightwatcher-ingest
+Description: Config-driven FITS ingest watcher for astrophotography
+ Watches an incoming directory, classifies each FITS frame from its header,
+ renames it to a standard, and files it into an organized archive tree.
+ .
+ Optional extras: stamp frames with a sky-brightness (SQM) reading from a
+ NightWatcher database, run configurable external hooks after each file is
+ filed, and register as an extension so a NightWatcher2 web-UI tab shows the
+ watcher's live activity.

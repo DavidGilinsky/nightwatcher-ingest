@@ -1,0 +1,19 @@
+#!/bin/sh
+# nightwatcher-ingest postrm: reload systemd; on purge, drop config + account.
+set -e
+
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+
+case "$1" in
+  purge)
+    rm -f /etc/nwingest/nwingest.yaml /etc/nwingest/nwingest.env
+    rmdir /etc/nwingest 2>/dev/null || true
+    if getent passwd nwingest >/dev/null 2>&1; then
+        deluser --system nwingest >/dev/null 2>&1 || true
+    fi
+    ;;
+esac
+
+exit 0
