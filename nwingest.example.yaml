@@ -56,7 +56,8 @@ resolve:
   object:
     messier_alias: true       # NGC 224 -> M31, etc. (map below / built-in defaults)
   filter:
-    osc_when_absent: "OSC"    # color cameras (BAYERPAT / *MC*) with no filter wheel
+    default: "CLEAR"          # filter name used when the header has none
+    write_header: true        # also write FILTER=<default> into lights/flats that lacked it
   gain_keywords: [GAIN, GAINRAW]   # tried in order; TheSkyX writes GAINRAW
   sequence:
     width: 4                  # zero-padded per-folder sequence, e.g. 0007

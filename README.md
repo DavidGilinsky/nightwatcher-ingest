@@ -59,8 +59,10 @@ The config controls everything (see the comments in
 2. **The directory structure**, as a `path` template per frame type.
 3. **The filename**, as a `filename` template per frame type.
 4. **How header values become variables** (rig by focal length, gain from
-   `GAIN` or `GAINRAW`, local noon-to-noon nights, Messier aliases, OSC for
-   filterless color cameras).
+   `GAIN` or `GAINRAW`, local noon-to-noon nights, Messier aliases, and `CLEAR`
+   as the default filter when a frame carries none). A light or flat whose
+   header has no `FILTER` also gets `FILTER=CLEAR` written into it, so WBPP
+   groups it correctly.
 5. **Hooks** (below).
 6. **SQM stamping and the web UI tab** (below).
 

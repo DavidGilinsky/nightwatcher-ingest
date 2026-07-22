@@ -90,7 +90,7 @@ DEFAULTS = {
     "resolve": {
         "night": {"mode": "noon-to-noon", "utc_offset_hours": -7},
         "object": {"messier_alias": True},
-        "filter": {"osc_when_absent": "OSC"},
+        "filter": {"default": "CLEAR", "write_header": True},
         "gain_keywords": ["GAIN", "GAINRAW"],
         "sequence": {"width": 4},
     },
@@ -270,11 +270,6 @@ def norm_object(h, cfg):
     return re.sub(r"[^\w+-]", "_", obj)
 
 
-def _is_color(h, camera):
-    return ("BAYERPAT" in h) or bool(re.search(r"MC\b", camera, re.I)) \
-        or camera.upper().endswith("MC")
-
-
 def _site_of(h, cfg):
     # NOTE: numeric SITELAT/SITELONG only for now; sexagesimal strings are a TODO.
     lat = fnum(h, "SITELAT", "OBSGEO-B")
@@ -295,16 +290,14 @@ def resolve(path, h, cfg):
     exp = fnum(h, "EXPTIME", "EXPOSURE")
     off = cfg["resolve"]["night"]["utc_offset_hours"]
 
-    filt = str(hget(h, "FILTER", default="") or "").strip()
-    if not filt and _is_color(h, camera):
-        filt = cfg["resolve"]["filter"]["osc_when_absent"]
+    raw_filter = str(hget(h, "FILTER", default="") or "").strip()
 
     return {
         "type": frame_type(h),
         "object": norm_object(h, cfg),
         "camera": camera,
         "rig": rig_of(camera, focal, cfg),
-        "filter": filt,
+        "filter": raw_filter or cfg["resolve"]["filter"]["default"],
         "night": night_of(dt, off) if dt else "",
         "utc": dt.strftime("%Y-%m-%dT%H%M%S") if dt else "",
         "exp": fmt_exp(exp),
@@ -316,6 +309,7 @@ def resolve(path, h, cfg):
         "ext": _ext(path),
         "_exp_num": exp,
         "_no_date": dt is None,
+        "_filter_defaulted": not raw_filter,
     }
 
 
@@ -441,6 +435,28 @@ def _dedupe(dst):
     while os.path.exists(f"{base}~{i}{ext}"):
         i += 1
     return f"{base}~{i}{ext}"
+
+
+# ---------------------------------------------------------------------------
+# Header normalization
+# ---------------------------------------------------------------------------
+def normalize_filter(path, kind, v, cfg, fits):
+    """Write the default FILTER into a filed light/flat whose header lacked one.
+
+    Broadband/no-filter frames often carry no FILTER card; WBPP groups by it,
+    so we set it explicitly (default CLEAR) rather than leaving it blank.
+    """
+    if kind not in ("light", "flat"):
+        return
+    if not v.get("_filter_defaulted"):
+        return
+    if not cfg["resolve"]["filter"].get("write_header", True):
+        return
+    try:
+        fits.setval(path, "FILTER", value=v["filter"],
+                    comment="filled by nwingest (header had none)")
+    except Exception as e:
+        log(f"    warn: could not set FILTER on {os.path.basename(path)}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -575,6 +591,7 @@ def process_dir(cfg, fits):
             if cfg["sqm"].get("enabled"):
                 stamp_sqm(f, v, cfg, fits)
             action, dest = move(f, dest, cfg["destination"]["on_conflict"])
+            normalize_filter(dest, kind, v, cfg, fits)
             run_hooks(dest, v, cfg)
             record({"src": f, "dest": dest, "kind": kind,
                     "object": v.get("object"), "status": action}, cfg)
