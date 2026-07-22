@@ -31,6 +31,8 @@ install -Dm0644 packaging/copyright       "$stage/usr/share/doc/$PKG/copyright"
 install -Dm0644 packaging/control   "$stage/DEBIAN/control"
 sed -i "s/^Version:.*/Version: $VER/" "$stage/DEBIAN/control"
 install -Dm0644 packaging/conffiles "$stage/DEBIAN/conffiles"
+install -Dm0644 packaging/templates "$stage/DEBIAN/templates"   # debconf questions
+install -Dm0755 packaging/config    "$stage/DEBIAN/config"      # debconf: ask them
 install -Dm0755 packaging/postinst  "$stage/DEBIAN/postinst"
 install -Dm0755 packaging/prerm     "$stage/DEBIAN/prerm"
 install -Dm0755 packaging/postrm    "$stage/DEBIAN/postrm"

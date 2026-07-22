@@ -1,0 +1,11 @@
+#!/bin/sh
+# debconf config script: ask the install-time configuration questions.
+set -e
+. /usr/share/debconf/confmodule
+
+db_input high   nightwatcher-ingest/incoming          || true
+db_input high   nightwatcher-ingest/enable_sqm        || true
+db_input high   nightwatcher-ingest/enable_extension  || true
+db_input high   nightwatcher-ingest/db_password       || true
+db_input medium nightwatcher-ingest/archive_group     || true
+db_go || true

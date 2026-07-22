@@ -45,13 +45,21 @@ make deb
 sudo apt install ./nightwatcher-ingest_0.1.0_all.deb
 ```
 
-It installs `nwingest` to `/usr/bin`, a default config to
-`/etc/nwingest/nwingest.yaml`, a `nwingest` systemd service, and pulls in
-`python3-astropy`, `python3-yaml`, and `python3-pymysql`. It creates an
-unprivileged `nwingest` service account (give it read on `incoming/` and write
-on the archive tree via group/ACL). Edit the config, set `NWDB_PASSWORD` in
-`/etc/nwingest/nwingest.env` if you use the DB features, then
-`sudo systemctl enable --now nwingest`.
+The install **prompts** for the watch directory, whether to enable the SQM
+stamp and the web-UI Ingest tab, the NightWatcher database password, and an
+optional group to grant the service account — and applies them to
+`/etc/nwingest/`. Re-run those prompts any time with:
+
+```sh
+sudo dpkg-reconfigure nightwatcher-ingest
+```
+
+It installs `nwingest` to `/usr/bin`, a `nwingest` systemd service, the config
+under `/etc/nwingest/`, and pulls in `python3-astropy`, `python3-yaml`, and
+`python3-pymysql`, creating an unprivileged `nwingest` service account. Give
+that account read on the watch directory and write on the archive tree (name a
+group at the prompt, or set ownership / an ACL), point the capture apps at the
+watch directory, then `sudo systemctl start nwingest`.
 
 **From source / other platforms:**
 

@@ -2,7 +2,7 @@ Package: nightwatcher-ingest
 Version: 0.0.0
 Architecture: all
 Maintainer: David Gilinsky <gilinsky@gilinskyresearch.com>
-Depends: python3 (>= 3.9), python3-astropy, python3-yaml, python3-pymysql
+Depends: python3 (>= 3.9), python3-astropy, python3-yaml, python3-pymysql, debconf (>= 0.5) | debconf-2.0
 Section: science
 Priority: optional
 Homepage: https://github.com/DavidGilinsky/nightwatcher-ingest

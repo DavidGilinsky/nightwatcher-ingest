@@ -1,15 +1,52 @@
 #!/bin/sh
-# nightwatcher-ingest postinst: create the service account and wire up systemd.
+# nightwatcher-ingest postinst: create the service account, apply the debconf
+# answers to /etc/nwingest/*, and wire up systemd.
 set -e
+. /usr/share/debconf/confmodule
+
+CFG=/etc/nwingest/nwingest.yaml
+ENVF=/etc/nwingest/nwingest.env
 
 case "$1" in
   configure)
-    # Dedicated, unprivileged system account for the watcher. It needs read
-    # access to the incoming directory and write access to the archive tree;
-    # grant that via group membership or an ACL on your NAS (site-specific).
+    # Unprivileged service account. It needs read on the incoming directory and
+    # write on the archive tree; grant that via the group below, ownership, or
+    # an ACL (site-specific).
     if ! getent passwd nwingest >/dev/null 2>&1; then
         adduser --system --group --no-create-home --home /nonexistent \
                 --gecos "NightWatcher ingest" nwingest >/dev/null 2>&1 || true
+    fi
+
+    db_get nightwatcher-ingest/incoming;         INCOMING="$RET"
+    db_get nightwatcher-ingest/enable_sqm;       SQM="$RET"
+    db_get nightwatcher-ingest/enable_extension; EXT="$RET"
+    db_get nightwatcher-ingest/db_password;      PW="$RET"
+    db_get nightwatcher-ingest/archive_group;    GRP="$RET"
+
+    # Apply the answers to the config. Only the top-level (2-space) sqm/extension
+    # keys are touched; the example hooks' 4-space `enabled:` are never matched.
+    if [ -f "$CFG" ]; then
+        [ -n "$INCOMING" ] && sed -i "s|^\(  incoming:\)[^#]*|\1 $INCOMING  |" "$CFG"
+        if [ "$SQM" = "true" ]; then sed -i 's/^  enabled: false/  enabled: true/' "$CFG"
+        else                         sed -i 's/^  enabled: true/  enabled: false/' "$CFG"; fi
+        if [ "$EXT" = "true" ]; then sed -i 's/^  register: false/  register: true/' "$CFG"
+        else                         sed -i 's/^  register: true/  register: false/' "$CFG"; fi
+    fi
+
+    # Secret -> env file. The shipped file carries only a placeholder; the value
+    # is written here (echoed verbatim, so it is safe for any characters).
+    if [ -f "$ENVF" ]; then
+        grep -v '^#\{0,1\}[[:space:]]*NWDB_PASSWORD=' "$ENVF" > "$ENVF.dpkg-new" 2>/dev/null || true
+        if [ -n "$PW" ]; then printf 'NWDB_PASSWORD=%s\n' "$PW" >> "$ENVF.dpkg-new"
+        else                  printf '#NWDB_PASSWORD=\n'       >> "$ENVF.dpkg-new"; fi
+        cat "$ENVF.dpkg-new" > "$ENVF"
+        rm -f "$ENVF.dpkg-new"
+        chmod 0640 "$ENVF"
+    fi
+
+    # Optional: add the service account to a group that can reach the archive.
+    if [ -n "$GRP" ] && getent group "$GRP" >/dev/null 2>&1; then
+        adduser nwingest "$GRP" >/dev/null 2>&1 || true
     fi
 
     if [ -d /run/systemd/system ]; then
@@ -17,9 +54,9 @@ case "$1" in
         systemctl enable nwingest.service >/dev/null 2>&1 || true
     fi
 
-    echo "nightwatcher-ingest: edit /etc/nwingest/nwingest.yaml (and set NWDB_PASSWORD"
-    echo "  in /etc/nwingest/nwingest.env if you enable the SQM stamp or the web-UI"
-    echo "  extension), then:  sudo systemctl start nwingest"
+    echo "nightwatcher-ingest configured. Make sure the 'nwingest' user can read the"
+    echo "  watch directory and write the archive, point the capture apps at it, then:"
+    echo "    sudo systemctl start nwingest      (re-run: dpkg-reconfigure nightwatcher-ingest)"
     ;;
 esac
 

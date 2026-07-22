@@ -1,0 +1,36 @@
+Template: nightwatcher-ingest/incoming
+Type: string
+Default: /astronomy/astro-imaging/incoming
+Description: Directory to watch for incoming FITS frames:
+ The watcher scans this directory (recursively) for new FITS files to classify,
+ rename, and file into the archive tree. Point your capture applications here.
+
+Template: nightwatcher-ingest/enable_sqm
+Type: boolean
+Default: true
+Description: Stamp frames with a sky-brightness (SQM) reading?
+ If enabled, each light frame is stamped with the nearest reading from the
+ NightWatcher database. Requires the database password below, and a matching
+ site entry in /etc/nwingest/nwingest.yaml.
+
+Template: nightwatcher-ingest/enable_extension
+Type: boolean
+Default: true
+Description: Show a NightWatcher2 web-UI "Ingest" tab while running?
+ If enabled, the watcher registers with NightWatcher2 so a tab shows its live
+ activity. Requires the database password below.
+
+Template: nightwatcher-ingest/db_password
+Type: password
+Description: NightWatcher database password:
+ Needed only for the SQM stamp and the web-UI tab. Leave blank to skip the
+ database features for now; you can set it later with:
+ dpkg-reconfigure nightwatcher-ingest
+
+Template: nightwatcher-ingest/archive_group
+Type: string
+Description: Group to grant the "nwingest" service account (optional):
+ The service runs as the unprivileged "nwingest" user, which needs read access
+ to the incoming directory and write access to the archive tree. If those are
+ group-accessible, name that group to add nwingest to it. Leave blank to arrange
+ access yourself (e.g. directory ownership or a filesystem ACL).
