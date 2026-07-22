@@ -95,8 +95,12 @@ sqm:
     password_env: NWDB_PASSWORD   # read the password from this environment variable
 
 # --- requirement 5: modular external programs run after a file is filed ---
-# Each hook is a named command template. {dest} is the final path; every
-# resolve variable ({object}, {filter}, {rig}, ...) is also available.
+# Each hook is a named command template. {dest} is the final path; every resolve
+# variable ({object}, {filter}, {rig}, ...) is also available. Commands run as
+# argv (no shell) unless you set `shell: true`. A failing, timed-out, or missing
+# hook is logged and skipped, never breaking ingestion. `timeout_s` applies to
+# foreground hooks; a `background: true` hook runs detached. Hooks fire only on
+# filed science frames (lights + calibration), not on review/ or quarantine/.
 hooks:
   - name: plate-solve-lights
     when: { type: light }         # match conditions on resolved variables

@@ -29,7 +29,9 @@ import errno
 import fnmatch
 import os
 import re
+import shlex
 import shutil
+import subprocess
 import sys
 import time
 from collections import defaultdict
@@ -571,21 +573,65 @@ def finalize_header(path, kind, v, cfg, fits, db):
 
 
 # ---------------------------------------------------------------------------
-# Stubs for the next build stage (hooks exec, DB log, extension registry)
+# External hooks: run configured programs on each filed frame (requirement 5)
 # ---------------------------------------------------------------------------
+_bg_hooks = []      # (Popen, name) for background hooks, reaped opportunistically
+
+
+def _reap_hooks():
+    global _bg_hooks
+    _bg_hooks = [(p, n) for p, n in _bg_hooks if p.poll() is None]
+
+
+def _hook_matches(when, v):
+    return all(str(v.get(k)) == str(val) for k, val in (when or {}).items())
+
+
+def _run_one_hook(hk, ctx):
+    name = hk.get("name", "hook")
+    use_shell = bool(hk.get("shell"))
+    # argv by default: split the template, then fill each token, so a substituted
+    # value with spaces stays one argument and the shell never sees it.
+    cmd = hk["run"].format_map(ctx) if use_shell \
+        else [tok.format_map(ctx) for tok in shlex.split(hk["run"])]
+    if hk.get("background"):
+        p = subprocess.Popen(cmd, shell=use_shell, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+        _bg_hooks.append((p, name))
+        log(f"    hook '{name}' started in background (pid {p.pid})")
+        return
+    r = subprocess.run(cmd, shell=use_shell, capture_output=True, text=True,
+                       timeout=hk.get("timeout_s", 120))
+    if r.returncode == 0:
+        log(f"    hook '{name}' ok")
+    else:
+        err = (r.stderr or r.stdout or "").strip().replace("\n", " ")[:200]
+        log(f"    hook '{name}' exited {r.returncode}: {err}")
+
+
 def run_hooks(dest, v, cfg):
-    """Requirement 5: run configured external programs on the filed file."""
-    for hk in cfg.get("hooks", []):
-        if not hk.get("enabled"):
+    """Run each enabled, matching hook on a filed frame. A hook never breaks
+    ingestion: failures, timeouts, and missing programs are logged and skipped."""
+    hooks = cfg.get("hooks", [])
+    if not hooks:
+        return
+    _reap_hooks()
+    ctx = defaultdict(str, {k: val for k, val in v.items() if not k.startswith("_")})
+    ctx["dest"] = dest
+    for hk in hooks:
+        if not hk.get("enabled") or not _hook_matches(hk.get("when"), v):
             continue
-        when = hk.get("when", {})
-        if any(str(v.get(k)) != str(val) for k, val in when.items()):
-            continue
-        # TODO: subprocess.run(hk["run"].format_map(defaultdict(str, {**v, "dest": dest})),
-        #       shell=True, timeout=hk.get("timeout_s"))  -- background if hk.get("background")
-        log(f"    hook (TODO) would run: {hk['name']}")
+        try:
+            _run_one_hook(hk, ctx)
+        except subprocess.TimeoutExpired:
+            log(f"    hook '{hk.get('name', 'hook')}' timed out")
+        except Exception as e:
+            log(f"    hook '{hk.get('name', 'hook')}' error: {e}")
 
 
+# ---------------------------------------------------------------------------
+# Stubs for the next build stage (DB log, extension registry)
+# ---------------------------------------------------------------------------
 def record(entry, cfg):
     """TODO: insert into nwdb ingest_log for the web UI Ingest tab."""
     return None
@@ -697,7 +743,8 @@ def process_dir(cfg, fits):
                 dest = place_live(f, v, kind, extra, cfg)
                 action, dest = move(f, dest, cfg["destination"]["on_conflict"])
                 edits = finalize_header(dest, kind, v, cfg, fits, db)
-                run_hooks(dest, v, cfg)
+                if kind in cfg["routes"]:      # hooks fire only on filed science frames
+                    run_hooks(dest, v, cfg)
                 record({"src": f, "dest": dest, "kind": kind,
                         "object": v.get("object"), "status": action}, cfg)
                 sqm = edits.get(cfg["sqm"].get("keyword", "SQM")) if edits else None

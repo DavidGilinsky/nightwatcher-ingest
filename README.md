@@ -111,9 +111,22 @@ hooks:
     enabled: true
 ```
 
-`{dest}` is the final path; every resolve variable is available too. Hooks are
-independent and individually toggled, so you add a plate solver, a notifier, or
-a trigger for your stacking pipeline without touching the code.
+`{dest}` is the final path; every resolve variable (`{object}`, `{filter}`,
+`{rig}`, ...) is available too. Details:
+
+- **Argv, not a shell.** The command is split into arguments and each is filled
+  in, so a substituted value never reaches a shell. Set `shell: true` on a hook
+  if you need pipes or redirects.
+- **Foreground vs background.** A foreground hook blocks until it finishes or
+  hits `timeout_s` (default 120 s); a `background: true` hook runs detached and
+  does not hold up the next frame.
+- **Isolated.** A hook that fails, times out, or is missing is logged and
+  skipped; it never breaks ingestion or the other hooks.
+- **Scope.** Hooks run on filed science frames (lights and calibration), not on
+  `review/` or `quarantine/` files.
+
+Hooks are independent and individually toggled, so you add a plate solver, a
+notifier, or a stacking trigger without touching the code.
 
 ## SQM stamping (optional)
 
@@ -133,9 +146,10 @@ up only when the tool is present.
 ## Status
 
 The config-driven classify/rename/file core, the read-only `plan` mode, the
-CLEAR filter default, and the **SQM stamp** (site-matched, nearest reading from
-the NightWatcher database, writing `SQM`/`SQMSRC`/`SQMTIME`/`SQMDT`) are working.
-The hook runner, the ingest log, and the web UI registration are stubbed and next.
+CLEAR filter default, the **SQM stamp** (site-matched, nearest reading from the
+NightWatcher database, writing `SQM`/`SQMSRC`/`SQMTIME`/`SQMDT`), and the
+**hook runner** are working. The ingest log and the web UI registration are
+stubbed and next.
 
 ## License
 
