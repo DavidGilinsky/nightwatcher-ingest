@@ -79,6 +79,14 @@ exclude_lights:
   path_tokens: ["@focus", "autofocus", "closed loop slew", "/slew/", "/preview/", "failed", "platesolve"]
   min_exposure_s: 30          # shorter "Light" frames are focus/test frames -> review
 
+# --- NightWatcher database (shared by the SQM stamp and the web UI extension) ---
+nwdb:
+  host: 127.0.0.1
+  port: 3306
+  name: nightwatcher
+  user: nightwatcher
+  password_env: NWDB_PASSWORD   # read the DB password from this environment variable
+
 # --- SQM stamping from NightWatcher (optional; skipped if disabled) ---
 sqm:
   enabled: false              # turn on once the DB is reachable
@@ -87,12 +95,6 @@ sqm:
   max_gap_minutes: 15         # don't stamp if the nearest reading is older than this
   sites:                      # a frame is stamped only if its coordinates match a site
     - { name: CrestaLoma, lat: 32.30314, lon: -110.98589, tol_deg: 0.05, sensor: DSN036 }
-  nwdb:
-    host: 127.0.0.1
-    port: 3306
-    name: nightwatcher
-    user: nightwatcher
-    password_env: NWDB_PASSWORD   # read the password from this environment variable
 
 # --- requirement 5: modular external programs run after a file is filed ---
 # Each hook is a named command template. {dest} is the final path; every resolve
@@ -114,11 +116,14 @@ hooks:
     enabled: false
 
 # --- requirement 6: NightWatcher2 web UI integration (extension registry) ---
+# When on, nwingest registers + heartbeats in nwdb and logs each filed frame to
+# the ingest_log table, so a NightWatcher2 "Ingest" tab can show live activity
+# while the watcher runs (and disappear when it stops). Needs `nwdb` above.
 extension:
-  register: false             # register + heartbeat so the "Ingest" tab appears while running
+  register: false
   name: ingest
   label: Ingest
-  heartbeat_seconds: 20
+  heartbeat_seconds: 20         # min seconds between heartbeats (advisory)
 
 logging:
   level: info                 # debug | info | warning | error

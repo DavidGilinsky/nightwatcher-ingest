@@ -143,13 +143,19 @@ UI showing recent activity. Stop the watcher and the tab goes away. NightWatcher
 itself stays a clean standalone SQM tool; this is an optional extension it lights
 up only when the tool is present.
 
+The watcher side is in place: it fills `ingest_log` and maintains its row in the
+`extensions` registry (both tables auto-created). Rendering the tab is done by
+NightWatcher2 and is the next piece of work.
+
 ## Status
 
-The config-driven classify/rename/file core, the read-only `plan` mode, the
-CLEAR filter default, the **SQM stamp** (site-matched, nearest reading from the
-NightWatcher database, writing `SQM`/`SQMSRC`/`SQMTIME`/`SQMDT`), and the
-**hook runner** are working. The ingest log and the web UI registration are
-stubbed and next.
+Working: classify/rename/file, the read-only `plan` mode, the CLEAR filter
+default, the **SQM stamp** (site-matched, nearest reading from the NightWatcher
+database, writing `SQM`/`SQMSRC`/`SQMTIME`/`SQMDT`), the **hook runner**, and the
+**ingest log + extension registry** (each filed frame is recorded in
+`ingest_log`, and the watcher registers and heartbeats in `extensions` while it
+runs). What's left is the daemon side: the NightWatcher2 `/api/v1` endpoints that
+read those tables and the web UI Ingest tab that renders them.
 
 ## License
 

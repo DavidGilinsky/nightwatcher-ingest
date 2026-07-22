@@ -31,12 +31,15 @@ import os
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import time
 from collections import defaultdict
 from copy import deepcopy
 from datetime import datetime, timedelta
+
+__version__ = "0.1.0"
 
 try:
     import yaml
@@ -109,8 +112,10 @@ DEFAULTS = {
                         "/preview/", "failed", "platesolve"],
         "min_exposure_s": 30,
     },
+    "nwdb": {"host": "127.0.0.1", "port": 3306, "name": "nightwatcher",
+             "user": "nightwatcher", "password_env": "NWDB_PASSWORD"},
     "sqm": {"enabled": False, "keyword": "SQM", "provenance": True,
-            "max_gap_minutes": 15, "sites": [], "nwdb": {}},
+            "max_gap_minutes": 15, "sites": []},
     "hooks": [],
     "extension": {"register": False, "name": "ingest", "label": "Ingest",
                   "heartbeat_seconds": 20},
@@ -478,13 +483,48 @@ def _dedupe(dst):
 
 
 # ---------------------------------------------------------------------------
-# nwdb access (SQM lookup)
+# nwdb access: SQM lookup (read) + ingest log and extension registry (write)
 # ---------------------------------------------------------------------------
+INGEST_LOG_DDL = """
+CREATE TABLE IF NOT EXISTS ingest_log (
+    id         BIGINT       NOT NULL AUTO_INCREMENT,
+    ts_utc     DATETIME     NOT NULL,
+    frame_utc  DATETIME     NULL,
+    kind       VARCHAR(16)  NOT NULL,
+    `object`   VARCHAR(64)  NULL,
+    rig        VARCHAR(64)  NULL,
+    `filter`   VARCHAR(32)  NULL,
+    sqm        DECIMAL(6,3) NULL,
+    dest       VARCHAR(512) NOT NULL,
+    status     VARCHAR(16)  NOT NULL,
+    detail     VARCHAR(255) NULL,
+    created_at DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    KEY idx_ingest_ts (ts_utc)
+) ENGINE=InnoDB
+"""
+
+EXTENSIONS_DDL = """
+CREATE TABLE IF NOT EXISTS extensions (
+    name           VARCHAR(32)  NOT NULL,
+    label          VARCHAR(64)  NOT NULL,
+    version        VARCHAR(32)  NULL,
+    data_table     VARCHAR(64)  NULL,
+    host           VARCHAR(128) NULL,
+    pid            INT          NULL,
+    status         VARCHAR(16)  NOT NULL DEFAULT 'active',
+    last_heartbeat DATETIME     NOT NULL,
+    started_at     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (name)
+) ENGINE=InnoDB
+"""
+
+
 class Nwdb:
     """Lazy, reused connection to the NightWatcher database (PyMySQL)."""
 
     def __init__(self, cfg):
-        self.c = cfg["sqm"].get("nwdb", {})
+        self.c = cfg.get("nwdb", {})
         self.conn = None
 
     def _connect(self):
@@ -516,6 +556,50 @@ class Nwdb:
                 if attempt == 2:
                     log(f"    warn: nwdb query failed: {e}")
         return None
+
+    def _exec(self, sql, params=()):
+        for attempt in (1, 2):
+            try:
+                if self.conn is None:
+                    self._connect()
+                with self.conn.cursor() as cur:
+                    cur.execute(sql, params)
+                return True
+            except Exception as e:
+                self.conn = None
+                if attempt == 2:
+                    log(f"    warn: nwdb write failed: {e}")
+        return False
+
+    def ensure_schema(self):
+        self._exec(INGEST_LOG_DDL)
+        self._exec(EXTENSIONS_DDL)
+
+    def log_ingest(self, r):
+        self._exec(
+            "INSERT INTO ingest_log "
+            "(ts_utc, frame_utc, kind, `object`, rig, `filter`, sqm, dest, status, detail) "
+            "VALUES (UTC_TIMESTAMP(), %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (r.get("frame_utc"), r.get("kind"), r.get("object"), r.get("rig"),
+             r.get("filter"), r.get("sqm"), r.get("dest"), r.get("status"),
+             r.get("detail")))
+
+    def register(self, ext):
+        self._exec(
+            "INSERT INTO extensions "
+            "(name, label, version, data_table, host, pid, last_heartbeat, status) "
+            "VALUES (%s, %s, %s, %s, %s, %s, UTC_TIMESTAMP(), 'active') "
+            "ON DUPLICATE KEY UPDATE label=VALUES(label), version=VALUES(version), "
+            "data_table=VALUES(data_table), host=VALUES(host), pid=VALUES(pid), "
+            "last_heartbeat=UTC_TIMESTAMP(), status='active'",
+            (ext.get("name"), ext.get("label"), ext.get("version"),
+             ext.get("data_table"), ext.get("host"), ext.get("pid")))
+
+    def heartbeat(self, name):
+        self._exec("UPDATE extensions SET last_heartbeat=UTC_TIMESTAMP() WHERE name=%s", (name,))
+
+    def deregister(self, name):
+        self._exec("UPDATE extensions SET status='stopped' WHERE name=%s", (name,))
 
     def close(self):
         if self.conn:
@@ -630,24 +714,29 @@ def run_hooks(dest, v, cfg):
 
 
 # ---------------------------------------------------------------------------
-# Stubs for the next build stage (DB log, extension registry)
+# Ingest log + extension registry (groundwork for the web UI Ingest tab)
 # ---------------------------------------------------------------------------
-def record(entry, cfg):
-    """TODO: insert into nwdb ingest_log for the web UI Ingest tab."""
+def record(entry, db):
+    """Write one ingest_log row (no-op without a DB connection)."""
+    if db is not None:
+        db.log_ingest(entry)
+
+
+def make_db(cfg):
+    """A DB handle if any feature needs nwdb (SQM stamp or extension registry)."""
+    if cfg["sqm"].get("enabled") or cfg.get("extension", {}).get("register"):
+        return Nwdb(cfg)
     return None
 
 
-def register(cfg):
-    """Requirement 6: TODO upsert an extensions row so the NightWatcher2 Ingest
-    tab appears while this watcher is alive."""
-    if cfg["extension"].get("register"):
-        log("extension registration (TODO): would announce '%s' to nwdb"
-            % cfg["extension"].get("name"))
-
-
-def heartbeat(cfg):
-    """TODO: touch the extensions row so the tab stays visible while running."""
-    return None
+def register_extension(db, cfg):
+    ext = cfg.get("extension", {})
+    if db is None or not ext.get("register"):
+        return
+    db.register({"name": ext.get("name", "ingest"), "label": ext.get("label", "Ingest"),
+                 "version": __version__, "data_table": "ingest_log",
+                 "host": socket.gethostname(), "pid": os.getpid()})
+    log(f"registered extension '{ext.get('name', 'ingest')}' (Ingest tab active while running)")
 
 
 # ---------------------------------------------------------------------------
@@ -730,56 +819,75 @@ def do_plan(cfg, indir):
     return 0
 
 
-def process_dir(cfg, fits):
+def process_dir(cfg, fits, db):
     files = scan(cfg["watch"]["incoming"], cfg, require_stable=True)
     if not files:
         return 0
-    db = Nwdb(cfg) if cfg["sqm"].get("enabled") else None
+    root = cfg["destination"]["root"]
+    kw = cfg["sqm"].get("keyword", "SQM")
     n = 0
-    try:
-        for f in files:
-            try:
-                v, kind, extra = analyze(f, cfg, fits)
-                dest = place_live(f, v, kind, extra, cfg)
-                action, dest = move(f, dest, cfg["destination"]["on_conflict"])
-                edits = finalize_header(dest, kind, v, cfg, fits, db)
-                if kind in cfg["routes"]:      # hooks fire only on filed science frames
-                    run_hooks(dest, v, cfg)
-                record({"src": f, "dest": dest, "kind": kind,
-                        "object": v.get("object"), "status": action}, cfg)
-                sqm = edits.get(cfg["sqm"].get("keyword", "SQM")) if edits else None
-                note = f"  SQM={sqm[0]}" if sqm else ""
-                log(f"  {kind:10} {os.path.basename(f)} -> "
-                    f"{os.path.relpath(dest, cfg['destination']['root'])} [{action}]{note}")
-                n += 1
-            except Exception as e:
-                log(f"  ERROR {os.path.basename(f)}: {e}")
-    finally:
-        if db:
-            db.close()
+    for f in files:
+        try:
+            v, kind, extra = analyze(f, cfg, fits)
+            dest = place_live(f, v, kind, extra, cfg)
+            action, dest = move(f, dest, cfg["destination"]["on_conflict"])
+            edits = finalize_header(dest, kind, v, cfg, fits, db)
+            if kind in cfg["routes"]:          # hooks fire only on filed science frames
+                run_hooks(dest, v, cfg)
+            sqm_val = float(edits[kw][0]) if (edits and kw in edits) else None
+            reldest = os.path.relpath(dest, root)
+            record({"frame_utc": v.get("_dt_utc"), "kind": kind,
+                    "object": v.get("object") or None, "rig": v.get("rig") or None,
+                    "filter": (v.get("filter") if kind in ("light", "flat") else None),
+                    "sqm": sqm_val, "dest": reldest, "status": action}, db)
+            note = f"  SQM={sqm_val}" if sqm_val else ""
+            log(f"  {kind:10} {os.path.basename(f)} -> {reldest} [{action}]{note}")
+            n += 1
+        except Exception as e:
+            log(f"  ERROR {os.path.basename(f)}: {e}")
+            record({"kind": "error", "dest": os.path.basename(f),
+                    "status": "error", "detail": str(e)[:200]}, db)
     return n
 
 
 def do_once(cfg):
     fits = _need_astropy()
-    n = process_dir(cfg, fits)
+    db = make_db(cfg)
+    if db:
+        db.ensure_schema()
+    try:
+        n = process_dir(cfg, fits, db)
+    finally:
+        if db:
+            db.close()
     log(f"once: processed {n} file(s)")
     return 0
 
 
 def do_watch(cfg):
     fits = _need_astropy()
-    register(cfg)
+    db = make_db(cfg)
+    if db:
+        db.ensure_schema()
+    register_extension(db, cfg)
+    ext = cfg.get("extension", {})
+    name = ext.get("name", "ingest")
     interval = cfg["watch"]["poll_seconds"]
     log(f"watching {cfg['watch']['incoming']} every {interval}s "
         f"(stable={cfg['watch']['stable_seconds']}s)")
     try:
         while True:
-            process_dir(cfg, fits)
-            heartbeat(cfg)
+            process_dir(cfg, fits, db)
+            if db and ext.get("register"):
+                db.heartbeat(name)
             time.sleep(interval)
     except KeyboardInterrupt:
         log("watch: stopped")
+    finally:
+        if db and ext.get("register"):
+            db.deregister(name)
+        if db:
+            db.close()
     return 0
 
 
