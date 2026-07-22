@@ -844,10 +844,13 @@ def process_dir(cfg, fits, db):
                 run_hooks(dest, v, cfg)
             sqm_val = float(edits[kw][0]) if (edits and kw in edits) else None
             reldest = os.path.relpath(dest, root)
+            # `action` (rename/copy/skip) is how the file was moved; the recorded
+            # status is the disposition -- a filed frame reads "filed", not "rename".
+            status = "filed" if action in ("rename", "copy") else action
             record({"frame_utc": v.get("_dt_utc"), "kind": kind,
                     "object": v.get("object") or None, "rig": v.get("rig") or None,
                     "filter": (v.get("filter") if kind in ("light", "flat") else None),
-                    "sqm": sqm_val, "dest": reldest, "status": action}, db)
+                    "sqm": sqm_val, "dest": reldest, "status": status}, db)
             note = f"  SQM={sqm_val}" if sqm_val else ""
             log(f"  {kind:10} {os.path.basename(f)} -> {reldest} [{action}]{note}")
             if db is not None and cfg.get("events", {}).get("enabled", True):
