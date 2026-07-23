@@ -175,13 +175,15 @@ standalone SQM tool; this is an optional extension it lights up only when presen
 
 ## Status
 
-Working: classify/rename/file, the read-only `plan` mode, the CLEAR filter
-default, the **SQM stamp** (site-matched, nearest reading from the NightWatcher
-database, writing `SQM`/`SQMSRC`/`SQMTIME`/`SQMDT`), the **hook runner**, and the
-**ingest log + extension registry** (each filed frame is recorded in
-`ingest_log`, and the watcher registers and heartbeats in `extensions` while it
-runs). What's left is the daemon side: the NightWatcher2 `/api/v1` endpoints that
-read those tables and the web UI Ingest tab that renders them.
+Working end-to-end and deployed. That covers classify/rename/file, the read-only
+`plan` mode, the CLEAR filter default, the **SQM stamp** (site-matched, nearest
+reading from the NightWatcher database, writing `SQM`/`SQMSRC`/`SQMTIME`/`SQMDT`), the
+**hook runner**, the **ingest log** (each filed frame recorded in `ingest_log`), and
+the **extension registry** — the watcher registers and heartbeats in NightWatcher while
+it runs, so the daemon's `/api/v1/extensions` endpoints light up a live **Ingest** tab
+in the [NightWatcher2](https://github.com/DavidGilinsky/NightWatcher2) web UI, and each
+transfer is also written to NightWatcher's shared `events` table. The Debian package
+(above) installs it with a debconf setup that `dpkg-reconfigure` can re-run.
 
 ## License
 
