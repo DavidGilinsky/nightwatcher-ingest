@@ -1,12 +1,14 @@
 # nightwatcher-ingest — source install / Debian package
 # Debian/Ubuntu: prefer `make deb` + `apt install ./nightwatcher-ingest_*.deb`.
-PREFIX  ?= /usr
+PREFIX  ?= /usr/local/nwingest
 DESTDIR ?=
 
 .PHONY: install uninstall deb clean
 
 install:
 	install -Dm0755 nwingest.py $(DESTDIR)$(PREFIX)/bin/nwingest
+	install -d $(DESTDIR)/usr/local/bin
+	ln -sf $(PREFIX)/bin/nwingest $(DESTDIR)/usr/local/bin/nwingest
 	install -Dm0644 systemd/nwingest.service $(DESTDIR)/lib/systemd/system/nwingest.service
 	@if [ ! -f $(DESTDIR)/etc/nwingest/nwingest.yaml ]; then \
 	    install -Dm0644 nwingest.example.yaml $(DESTDIR)/etc/nwingest/nwingest.yaml; \
@@ -17,6 +19,7 @@ install:
 
 uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/bin/nwingest
+	rm -f $(DESTDIR)/usr/local/bin/nwingest
 	rm -f $(DESTDIR)/lib/systemd/system/nwingest.service
 	@echo "Left /etc/nwingest/ in place (remove it manually if you want)."
 

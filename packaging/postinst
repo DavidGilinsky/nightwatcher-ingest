@@ -49,6 +49,12 @@ case "$1" in
         adduser nwingest "$GRP" >/dev/null 2>&1 || true
     fi
 
+    # CLI on PATH: link the tool from /usr/local/bin, mirroring nightwatcher and
+    # airwatcher (their binaries live under /usr/local/<project>/bin, symlinked
+    # here). dpkg does not track this link, so postrm removes it on removal.
+    [ -d /usr/local/bin ] || mkdir -p /usr/local/bin
+    ln -sf /usr/local/nwingest/bin/nwingest /usr/local/bin/nwingest
+
     if [ -d /run/systemd/system ]; then
         systemctl daemon-reload >/dev/null 2>&1 || true
         systemctl enable nwingest.service >/dev/null 2>&1 || true

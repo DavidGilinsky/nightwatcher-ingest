@@ -7,6 +7,14 @@ if [ -d /run/systemd/system ]; then
     systemctl daemon-reload >/dev/null 2>&1 || true
 fi
 
+# The /usr/local/bin symlink is created by postinst and not tracked by dpkg, so
+# remove it when the package is removed or purged.
+case "$1" in
+  remove|purge)
+    rm -f /usr/local/bin/nwingest
+    ;;
+esac
+
 case "$1" in
   purge)
     rm -f /etc/nwingest/nwingest.yaml /etc/nwingest/nwingest.env

@@ -18,9 +18,9 @@ trap 'rm -rf "$stage"' EXIT INT TERM
 chmod 0755 "$stage"   # mktemp makes it 0700; the package root (./) must be 0755
 
 # --- payload -----------------------------------------------------------------
-install -Dm0755 nwingest.py              "$stage/usr/bin/nwingest"
+install -Dm0755 nwingest.py              "$stage/usr/local/nwingest/bin/nwingest"
 # Debian policy prefers an explicit interpreter over /usr/bin/env.
-sed -i '1s|^#!.*|#!/usr/bin/python3|' "$stage/usr/bin/nwingest"
+sed -i '1s|^#!.*|#!/usr/bin/python3|' "$stage/usr/local/nwingest/bin/nwingest"
 install -Dm0644 nwingest.example.yaml    "$stage/etc/nwingest/nwingest.yaml"
 install -Dm0640 packaging/nwingest.env   "$stage/etc/nwingest/nwingest.env"
 install -Dm0644 systemd/nwingest.service "$stage/lib/systemd/system/nwingest.service"

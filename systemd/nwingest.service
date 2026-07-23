@@ -18,7 +18,7 @@ Type=simple
 #   systemctl edit nwingest   ->   [Service]\nUser=youruser\nGroup=yourgroup
 User=nwingest
 Group=nwingest
-ExecStart=/usr/bin/nwingest --config /etc/nwingest/nwingest.yaml watch
+ExecStart=/usr/local/nwingest/bin/nwingest --config /etc/nwingest/nwingest.yaml watch
 Restart=on-failure
 RestartSec=10
 # Secrets (e.g. NWDB_PASSWORD=...) live here, not in the unit or the YAML.
