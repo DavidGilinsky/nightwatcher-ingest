@@ -7,7 +7,7 @@
 #             an archive tree. Optional SQM stamping, external hooks, and
 #             NightWatcher2 web UI registration.
 #  Created  : 2026-07-21
-#  Modified : 2026-07-21
+#  Modified : 2026-07-23
 #  Version  : 0.1.0
 #  License  : GPL-3.0-or-later
 # ============================================================================
@@ -101,6 +101,18 @@ DEFAULTS = {
     },
     "rigs": [],
     "camera_aliases": {},
+    # Optional: source rig folder names from StarBase (the source of truth) when
+    # it is reachable. Off by default; enable in nwingest.yaml. When on and a rig
+    # matches, StarBase's v_rig_resolve view wins over the local `rigs` table.
+    "starbase": {
+        "enabled": False,
+        "refresh_s": 300,
+        "db": {
+            "host": "127.0.0.1", "port": 3306, "user": "nightwatcher",
+            "name": "starbase", "view": "v_rig_resolve",
+            "password_env": "NWDB_PASSWORD",
+        },
+    },
     # A convenience subset of NGC -> Messier. Extend via config.messier.
     "messier": {
         "NGC224": "M31", "NGC598": "M33", "NGC1952": "M1", "NGC5194": "M51",
@@ -256,7 +268,78 @@ def norm_camera(h, cfg):
     return re.sub(r"[^\w+-]", "", cam) or "UNKNOWN"
 
 
+class _StarbaseRigs:
+    """Cached reader of StarBase's `v_rig_resolve` view: (camera model, focal
+    length) -> rig name.
+
+    Optional integration. When cfg['starbase']['enabled'] and StarBase is
+    reachable, its rig definitions are the source of truth for the equipment
+    folder name. Every failure (StarBase absent, no grant, connection or query
+    error) is swallowed so the caller falls back to the local `rigs` table and
+    then the bare camera model. The view is read at most once per `refresh_s`;
+    a stale cache is preferred over a hard failure.
+    """
+
+    def __init__(self):
+        self._rows = None      # list[(camera_model, focal_min, focal_max, rig_name)]
+        self._loaded = 0.0     # time.monotonic() of the last successful load
+
+    def rig(self, camera, focal, cfg):
+        sb = cfg.get("starbase", {}) or {}
+        if not sb.get("enabled") or focal is None or not camera:
+            return None
+        rows = self._rows_cached(sb)
+        if not rows:
+            return None
+        # Exact canonical-model match + focal within the rig's window, mirroring
+        # StarBase's own (camera_id, focal range) resolution.
+        for cam, lo, hi, name in rows:
+            if cam and cam.lower() == camera.lower() and lo <= focal <= hi:
+                return name
+        return None
+
+    def _rows_cached(self, sb):
+        ttl = float(sb.get("refresh_s", 300))
+        if self._rows is not None and (time.monotonic() - self._loaded) < ttl:
+            return self._rows
+        try:
+            self._rows = self._load(sb.get("db", {}))
+            self._loaded = time.monotonic()
+        except Exception as e:
+            # Keep any prior cache; if we never loaded, the caller falls back.
+            log(f"    warn: StarBase rig lookup unavailable: {e}")
+        return self._rows
+
+    @staticmethod
+    def _load(db):
+        import pymysql
+        pw = os.environ.get(db.get("password_env", "NWDB_PASSWORD"), "")
+        conn = pymysql.connect(
+            host=db.get("host", "127.0.0.1"), port=int(db.get("port", 3306)),
+            user=db.get("user", "nightwatcher"), password=pw,
+            database=db.get("name", "starbase"), autocommit=True,
+            connect_timeout=int(db.get("connect_timeout", 5)))
+        try:
+            view = db.get("view", "v_rig_resolve")
+            with conn.cursor() as cur:
+                cur.execute("SELECT camera_model, focal_min_mm, focal_max_mm, "
+                            f"rig_name FROM {view}")
+                return [(r[0], float(r[1]), float(r[2]), r[3])
+                        for r in cur.fetchall()]
+        finally:
+            conn.close()
+
+
+_STARBASE_RIGS = _StarbaseRigs()
+
+
 def rig_of(camera, focal, cfg):
+    # StarBase is the source of truth for rig names when the integration is on
+    # and reachable (cfg['starbase']); otherwise fall back to the local `rigs`
+    # table, then to the bare camera model.
+    name = _STARBASE_RIGS.rig(camera, focal, cfg)
+    if name:
+        return name
     for r in cfg["rigs"]:
         want = r.get("camera")
         if want and want.lower() not in camera.lower():

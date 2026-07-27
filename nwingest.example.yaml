@@ -62,7 +62,9 @@ resolve:
   sequence:
     width: 4                  # zero-padded per-folder sequence, e.g. 0007
 
-# rigs identified by camera + focal length (TELESCOP is the mount, unreliable)
+# Rigs identified by camera + focal length (TELESCOP is the mount, unreliable).
+# When the `starbase` integration below is enabled and reachable, StarBase's rig
+# definitions win and this table is only the offline fallback.
 rigs:
   - { camera: ASI6200, focal_mm: [1280, 1310], name: Askar185-ASI6200 }
   - { camera: ASI2600, focal_mm: [435, 448],   name: WO73A-ASI2600 }
@@ -70,6 +72,25 @@ rigs:
 
 camera_aliases:
   ASICamera: ASI6200          # TheSkyX's generic camera name -> the real model
+
+# --- StarBase rig integration (optional) ---
+# StarBase (a separate tool) is the source of truth for rig definitions. When
+# enabled, nwingest reads its `v_rig_resolve` view (camera model + focal length
+# -> rig name) on the same MariaDB instance and uses that for the {rig} folder
+# segment. Resolution order: StarBase -> the local `rigs:` table above -> the
+# bare camera model. Any StarBase outage falls through silently, so ingestion
+# never blocks on it. Requires SELECT on starbase.v_rig_resolve for this user
+# (StarBase's installer grants it when nightwatcher-ingest is present).
+starbase:
+  enabled: false              # turn on to let StarBase name the rig folders
+  refresh_s: 300              # re-read the rig table at most this often
+  db:
+    host: 127.0.0.1
+    port: 3306
+    user: nightwatcher        # same instance/user as nwdb below
+    name: starbase            # StarBase's database
+    view: v_rig_resolve
+    password_env: NWDB_PASSWORD   # reuses the nwdb password env var
 
 # extra NGC->M aliases beyond the built-in set (optional)
 messier:
