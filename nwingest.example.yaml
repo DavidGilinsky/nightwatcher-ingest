@@ -55,6 +55,11 @@ resolve:
     utc_offset_hours: -7      # observatory local offset (Phoenix = -7, no DST)
   object:
     messier_alias: true       # NGC 224 -> M31, etc. (map below / built-in defaults)
+    # Catalog designations are compacted to a single canonical directory form, so
+    # a capture app that writes "NGC 6992" lands in the same folder as one that
+    # writes "NGC6992" (compact wins). Only these prefixes are compacted; free-form
+    # target names keep their spaces-as-underscores.
+    compact_catalogs: [NGC, IC, M, UGC, PGC, AGC, ARP, MRK, HCG]
   filter:
     default: "CLEAR"          # filter name used when the header has none
     write_header: true        # also write FILTER=<default> into lights/flats that lacked it

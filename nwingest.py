@@ -7,7 +7,7 @@
 #             an archive tree. Optional SQM stamping, external hooks, and
 #             NightWatcher2 web UI registration.
 #  Created  : 2026-07-21
-#  Modified : 2026-07-23
+#  Modified : 2026-07-26
 #  Version  : 0.1.0
 #  License  : GPL-3.0-or-later
 # ============================================================================
@@ -94,7 +94,8 @@ DEFAULTS = {
     },
     "resolve": {
         "night": {"mode": "noon-to-noon", "utc_offset_hours": -7},
-        "object": {"messier_alias": True},
+        "object": {"messier_alias": True,
+                   "compact_catalogs": ["NGC", "IC", "M", "UGC", "PGC", "AGC", "ARP", "MRK", "HCG"]},
         "filter": {"default": "CLEAR", "write_header": True},
         "gain_keywords": ["GAIN", "GAINRAW"],
         "sequence": {"width": 4},
@@ -350,11 +351,25 @@ def rig_of(camera, focal, cfg):
     return camera or "UNKNOWN"
 
 
+def _compact_catalog(obj, cats):
+    """Normalize a catalog designation to compact directory form, e.g.
+    'NGC 6992' -> 'NGC6992', 'M 31' -> 'M31'. Only recognized catalog prefixes
+    (cats, upper-cased) are compacted; free-form target names are returned
+    unchanged. This stops a capture app that writes 'NGC 6992' from forking a
+    separate folder from one that writes 'NGC6992'."""
+    m = re.match(r"^([A-Za-z]+)\s+(\d+[A-Za-z]?)$", obj.strip())
+    if m and m.group(1).upper() in cats:
+        return m.group(1).upper() + m.group(2)
+    return obj
+
+
 def norm_object(h, cfg):
     obj = str(hget(h, "OBJECT", default="") or "").strip()
     if not obj:
         return ""
-    if cfg["resolve"]["object"].get("messier_alias"):
+    ocfg = cfg["resolve"]["object"]
+    obj = _compact_catalog(obj, {c.upper() for c in ocfg.get("compact_catalogs", [])})
+    if ocfg.get("messier_alias"):
         key = obj.upper().replace(" ", "")
         if key in cfg["messier"]:
             return cfg["messier"][key]
