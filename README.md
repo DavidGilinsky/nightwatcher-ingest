@@ -19,16 +19,31 @@ when you configure them.
 ## What it does per frame
 
 ```
-incoming/  ->  read header  ->  classify  ->  rename  ->  file into the tree  ->  hooks
+incoming/  ->  check structure  ->  read header  ->  classify  ->  rename  ->  file into the tree  ->  stamp header  ->  hooks
 ```
 
+- **Check structure** before anything moves: is the file whole (header, END
+  card, exactly the padded image data)? A short file is left in `incoming/` to
+  finish; one with stray bytes after the image is a torn copy and goes to
+  `quarantine/torn/`. A torn copy's header reads fine, but its pixel rows come
+  from two layouts of the same frame, so filing it would only hide the damage.
 - **Classify** the frame type (light, dark, flat, bias, flatdark) from the header.
 - **Resolve** the target, rig, filter, night, exposure, gain, offset, binning,
   and temperature into template variables.
 - **Rename** using a configurable filename template.
 - **File** into a configurable directory structure.
+- **Stamp** the header: `FILTER` when the frame carries none, and the SQM cards
+  when enabled. The two are decided independently, so a failed SQM lookup never
+  costs a frame its `FILTER`. nwingest writes the header itself (in place when it
+  fits, otherwise through a temp file and rename), so a frame is never left
+  half-updated.
 - Light frames that are really focus, slew, or preview shots go to `review/`;
   frames with a broken or missing header go to `quarantine/`. Nothing is deleted.
+- Every step that could not be completed is logged as a `warn:` line naming the
+  file and the step, carried in the ingest log's `detail` column and the events
+  row, and counted in a summary line at the end of each cycle (`watch`) or run
+  (`once`): filed, quarantined by reason, deferred, frames filed without a
+  keyword, header writes that failed.
 
 Example result:
 
@@ -103,6 +118,7 @@ never leaves a `__` in the name.
 nwingest --config /etc/nwingest/nwingest.yaml plan [DIR]   # read-only: show what would happen
 nwingest --config /etc/nwingest/nwingest.yaml once         # process incoming once, then exit
 nwingest --config /etc/nwingest/nwingest.yaml watch        # poll incoming forever
+nwingest --config /etc/nwingest/nwingest.yaml backfill DIR [--dry-run] [--hooks]
 ```
 
 Start with `plan`. It moves nothing, it just prints the old name and where each
@@ -121,6 +137,34 @@ Over NFS it polls rather than using inotify, because an NFS client cannot see
 writes made by other hosts. It only touches a file once it has been size-stable
 for a few seconds, which covers both an app writing directly and a network copy
 landing.
+
+## Backfill: repairing frames that were filed incomplete
+
+`backfill DIR` walks an archive directory and adds the cards nwingest would have
+written at ingest but did not: `FILTER` on lights and flats that have none, and
+the SQM cards on lights taken at a configured site with a reading in range. It
+never moves or renames anything, skips files that already have everything, and
+so changes nothing on a second run. Start with `--dry-run`, which lists each
+file and what would be added and writes nothing at all (no header, no database
+row, no hook):
+
+```sh
+nwingest backfill /astronomy/astro-imaging/lights/NGC7720/WO-UC-108-ASI4400/2026-10-03 --dry-run
+nwingest backfill /astronomy/astro-imaging/lights/NGC7720/WO-UC-108-ASI4400/2026-10-03
+```
+
+Two things it reports but does not fix. A file that is torn, short, or has no
+END card is listed under "needs re-copy" and left alone; the only repair is a
+fresh copy from the capture device. `--quarantine-torn` moves such files out of
+the archive into `quarantine/<reason>/` under the archive root (names kept,
+nothing deleted) so the fresh copies can be ingested in their place. A light without a WCS is flagged, because
+nwingest has no plate solver: the WCS on an ASIAir frame comes from the ASIAir
+itself, and otherwise from a solver hook. `--hooks` reruns the configured hooks
+on each file the backfill touched or still found incomplete, which is how a
+`solve-field` hook can fill the WCS in.
+
+Each backfilled frame is also written to `ingest_log` with status `backfill`
+and the cards that were added.
 
 ## Hooks (external programs)
 
@@ -173,12 +217,25 @@ shared `events` table, so it shows up in the **Events** tab next to the daemon's
 own events — a one-line audit per frame. NightWatcher2 itself stays a clean
 standalone SQM tool; this is an optional extension it lights up only when present.
 
+## Tests
+
+```sh
+python3 -m pytest -q tests/
+```
+
+The suite builds tiny FITS frames with the real byte layout, including the torn
+copy that broke the 2026-10-03 NGC7720 session, and covers the structural
+check, the independent FILTER/SQM steps, the header writer, and the backfill
+mode's dry run and idempotence.
+
 ## Status
 
 Working end-to-end and deployed. That covers classify/rename/file, the read-only
-`plan` mode, the CLEAR filter default, the **SQM stamp** (site-matched, nearest
+`plan` mode, the **structural check** (torn and short copies never reach the
+archive), the CLEAR filter default, the **SQM stamp** (site-matched, nearest
 reading from the NightWatcher database, writing `SQM`/`SQMSRC`/`SQMTIME`/`SQMDT`), the
-**hook runner**, the **ingest log** (each filed frame recorded in `ingest_log`), and
+**hook runner**, the **backfill** mode, per-cycle **summaries**, the **ingest log**
+(each filed frame recorded in `ingest_log`), and
 the **extension registry** — the watcher registers and heartbeats in NightWatcher while
 it runs, so the daemon's `/api/v1/extensions` endpoints light up a live **Ingest** tab
 in the [NightWatcher2](https://github.com/DavidGilinsky/NightWatcher2) web UI, and each

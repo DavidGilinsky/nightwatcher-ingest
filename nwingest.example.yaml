@@ -16,6 +16,8 @@ watch:
   incoming: /astronomy/astro-imaging/incoming   # directory to watch (recursive)
   poll_seconds: 45            # NFS-safe poll interval (inotify can't see other hosts' writes)
   stable_seconds: 10          # a file must be untouched this long before it's processed
+  truncated_after_s: 600      # a file still short of header+data is left to finish; after
+                              # this long without growing it goes to quarantine/truncated
   patterns: ["*.fits", "*.fit", "*.fts"]
   ignore: ["_gsdata_", ".tmp", ".part"]         # GoodSync staging, partial writes
 
@@ -157,6 +159,10 @@ extension:
 events:
   enabled: true
 
+# Every file gets one transfer line; anything that could not be done to it is a
+# "warn:" line naming the file and the step, and each cycle/run ends with a
+# summary (filed, quarantined by reason, deferred, filed-without-keyword counts).
+# `nwingest backfill DIR [--dry-run]` repairs frames filed without FILTER/SQM.
 logging:
   level: info                 # debug | info | warning | error
   file: null                  # e.g. /var/log/nwingest/nwingest.log (null = stdout only)

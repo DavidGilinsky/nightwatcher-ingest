@@ -7,16 +7,18 @@
 #             an archive tree. Optional SQM stamping, external hooks, and
 #             NightWatcher2 web UI registration.
 #  Created  : 2026-07-21
-#  Modified : 2026-07-26
-#  Version  : 0.1.0
+#  Modified : 2026-10-04
+#  Version  : 0.2.0
 #  License  : GPL-3.0-or-later
 # ============================================================================
 """nwingest: watch, classify, rename, and file FITS frames by configuration.
 
 Modes:
-  plan   scan a directory and print what would happen (read-only, moves nothing)
-  once   process the incoming directory a single time, then exit
-  watch  poll the incoming directory forever (run under systemd)
+  plan      scan a directory and print what would happen (read-only, moves nothing)
+  once      process the incoming directory a single time, then exit
+  watch     poll the incoming directory forever (run under systemd)
+  backfill  add nwingest's missing header cards to already-filed frames
+            (FILTER, SQM); --dry-run lists what would change and writes nothing
 
 Everything is header-driven: the paths and filenames the capture apps produce
 are never trusted, only the FITS header. See nwingest.example.yaml.
@@ -39,7 +41,7 @@ from collections import defaultdict
 from copy import deepcopy
 from datetime import datetime, timedelta
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 try:
     import yaml
@@ -57,6 +59,10 @@ DEFAULTS = {
         "incoming": "/astronomy/astro-imaging/incoming",
         "poll_seconds": 45,
         "stable_seconds": 10,
+        # A file whose size is still short of header + data is left in place
+        # (something is still writing it). After this many seconds without
+        # growth it is quarantined as truncated instead.
+        "truncated_after_s": 600,
         "patterns": ["*.fits", "*.fit", "*.fts"],
         "ignore": ["_gsdata_", ".tmp", ".part"],
     },
@@ -161,14 +167,46 @@ def load_config(path):
 
 
 # ---------------------------------------------------------------------------
-# Small logging helpers
+# Small logging helpers. One line per event, `[timestamp] message`, to stdout
+# (the journal under systemd) and optionally to logging.file. logging.level
+# filters; warnings keep the literal "warn:" prefix so existing greps still work.
 # ---------------------------------------------------------------------------
+_LOG_LEVELS = {"debug": 10, "info": 20, "warning": 30, "warn": 30, "error": 40}
+_log_state = {"level": 20, "fh": None}
+
+
 def _now_str():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def log(msg):
-    print(f"[{_now_str()}] {msg}", flush=True)
+def configure_logging(cfg):
+    lc = cfg.get("logging", {}) or {}
+    _log_state["level"] = _LOG_LEVELS.get(str(lc.get("level", "info")).lower(), 20)
+    path = lc.get("file")
+    if path:
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            _log_state["fh"] = open(path, "a")
+        except OSError as e:
+            print(f"[{_now_str()}]     warn: cannot open log file {path}: {e}", flush=True)
+
+
+def log(msg, level="info"):
+    if _LOG_LEVELS.get(level, 20) < _log_state["level"]:
+        return
+    line = f"[{_now_str()}] {msg}"
+    print(line, flush=True)
+    fh = _log_state["fh"]
+    if fh is not None:
+        try:
+            fh.write(line + "\n")
+            fh.flush()
+        except OSError:
+            pass
+
+
+def warn(msg):
+    log(f"    warn: {msg}", "warning")
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +277,98 @@ def fmt_exp(x):
 
 
 # ---------------------------------------------------------------------------
+# Structural check: is this a whole, single-image FITS file? Pure byte
+# inspection, no astropy, so it is cheap enough to run on every file before
+# anything is moved. It exists because a copy taken while the capture device
+# was rewriting the frame (the 2026-10-03 NGC7720 tear, see rca/) passes a
+# header read but carries pixel rows from two layouts plus a stray trailing
+# block; astropy's update mode then fails on the trailing block, and a header
+# patch would only hide the broken image.
+# ---------------------------------------------------------------------------
+FITS_BLOCK = 2880
+_HDR_SCAN_BLOCKS = 128          # give up looking for END after 360 KB of header
+_WCS_KEYS = ("CTYPE1", "CTYPE2", "CRVAL1", "CRVAL2", "CRPIX1", "CRPIX2")
+
+
+def fits_structure(path):
+    """Return (status, info) for the FITS file at `path`.
+
+    status:
+      ok          END card found and the size is header + padded data, or a
+                  real extension (XTENSION) follows the primary data
+      no-end      no END card within the first _HDR_SCAN_BLOCKS blocks
+      bad-header  BITPIX/NAXIS cards missing or unparsable
+      short       smaller than header + padded data: still being written, or cut
+      trailing    bytes after the padded data that are neither an extension
+                  nor blank padding: a torn copy
+    info: size, hdr_bytes, data_bytes, expected, extra (where known).
+    """
+    size = os.path.getsize(path)
+    info = {"size": size, "hdr_bytes": None}
+    cards = {}
+    hdr_bytes = None
+    with open(path, "rb") as fh:
+        for blk in range(_HDR_SCAN_BLOCKS):
+            block = fh.read(FITS_BLOCK)
+            if len(block) < FITS_BLOCK:
+                break
+            for i in range(0, FITS_BLOCK, 80):
+                card = block[i:i + 80]
+                if card[:8] == b"END     ":
+                    hdr_bytes = (blk + 1) * FITS_BLOCK
+                    break
+                if card[8:10] == b"= ":
+                    key = card[:8].strip().decode("ascii", "replace")
+                    cards[key] = card[10:].split(b"/", 1)[0].strip().decode("ascii", "replace")
+            if hdr_bytes is not None:
+                break
+        if hdr_bytes is None:
+            return ("no-end", info)
+        info["hdr_bytes"] = hdr_bytes
+        try:
+            bitpix = abs(int(cards["BITPIX"]))
+            naxis = int(cards["NAXIS"])
+            npix = 1
+            for ax in range(1, naxis + 1):
+                npix *= int(cards[f"NAXIS{ax}"])
+            data_bytes = (bitpix // 8) * npix if naxis > 0 else 0
+        except (KeyError, ValueError):
+            return ("bad-header", info)
+        padded = ((data_bytes + FITS_BLOCK - 1) // FITS_BLOCK) * FITS_BLOCK
+        expected = hdr_bytes + padded
+        info.update(data_bytes=data_bytes, expected=expected, extra=size - expected)
+        if size < expected:
+            return ("short", info)
+        if size == expected:
+            return ("ok", info)
+        fh.seek(expected)
+        tail = fh.read(64 * 1024)
+        if tail.startswith(b"XTENSION"):
+            return ("ok", info)             # multi-HDU file; astropy owns those
+        if not tail.strip(b"\0") or not tail.strip(b" "):
+            return ("ok", info)             # blank padding after the data: harmless
+        return ("trailing", info)
+
+
+def describe_structure(status, info):
+    if status == "short":
+        return (f"short file: {info['size']} of {info['expected']} bytes "
+                f"({info['expected'] - info['size']} missing)")
+    if status == "trailing":
+        return (f"torn copy: {info['extra']} bytes after the image data; "
+                "re-copy from the capture device")
+    if status == "no-end":
+        return "no END card in the header"
+    if status == "bad-header":
+        return "BITPIX/NAXIS cards missing or unreadable"
+    return "ok"
+
+
+def has_wcs(h):
+    return all(k in h for k in _WCS_KEYS)
+
+
+# ---------------------------------------------------------------------------
 # Resolvers: header -> template variables
 # ---------------------------------------------------------------------------
 def frame_type(h):
@@ -284,6 +414,7 @@ class _StarbaseRigs:
     def __init__(self):
         self._rows = None      # list[(camera_model, focal_min, focal_max, rig_name)]
         self._loaded = 0.0     # time.monotonic() of the last successful load
+        self._failed = None    # time.monotonic() of the last failed load, if any
 
     def rig(self, camera, focal, cfg):
         sb = cfg.get("starbase", {}) or {}
@@ -301,14 +432,19 @@ class _StarbaseRigs:
 
     def _rows_cached(self, sb):
         ttl = float(sb.get("refresh_s", 300))
-        if self._rows is not None and (time.monotonic() - self._loaded) < ttl:
+        now = time.monotonic()
+        if self._rows is not None and (now - self._loaded) < ttl:
             return self._rows
+        if self._failed is not None and (now - self._failed) < ttl:
+            return self._rows               # already warned; retry after the window
         try:
             self._rows = self._load(sb.get("db", {}))
-            self._loaded = time.monotonic()
+            self._loaded = now
+            self._failed = None
         except Exception as e:
             # Keep any prior cache; if we never loaded, the caller falls back.
-            log(f"    warn: StarBase rig lookup unavailable: {e}")
+            self._failed = now
+            warn(f"StarBase rig lookup unavailable (retry in {int(ttl)}s): {e}")
         return self._rows
 
     @staticmethod
@@ -636,7 +772,10 @@ class Nwdb:
             connect_timeout=5)
 
     def nearest_reading(self, sensor, dt, gap_min):
-        """(ts_utc, mag) for the reading nearest dt within +/- gap_min, else None."""
+        """(ts_utc, mag) for the reading nearest dt within +/- gap_min, else None.
+
+        Raises after a second failed attempt, so the caller can tell "no
+        reading" from "could not ask"; the two are reported differently."""
         lo, hi = dt - timedelta(minutes=gap_min), dt + timedelta(minutes=gap_min)
         for attempt in (1, 2):
             try:
@@ -650,10 +789,10 @@ class Nwdb:
                         "ORDER BY ABS(TIMESTAMPDIFF(SECOND, ts_utc, %s)) LIMIT 1",
                         (sensor, lo, hi, dt))
                     return cur.fetchone()
-            except Exception as e:
+            except Exception:
                 self.conn = None
                 if attempt == 2:
-                    log(f"    warn: nwdb query failed: {e}")
+                    raise
         return None
 
     def _exec(self, sql, params=()):
@@ -667,7 +806,7 @@ class Nwdb:
             except Exception as e:
                 self.conn = None
                 if attempt == 2:
-                    log(f"    warn: nwdb write failed: {e}")
+                    warn(f"nwdb write failed: {e}")
         return False
 
     def ensure_schema(self):
@@ -717,16 +856,25 @@ class Nwdb:
 
 
 def lookup_sqm(v, cfg, db):
-    """Header cards for the SQM reading nearest this light frame, or None."""
+    """(cards, reason) for the SQM reading nearest this light frame.
+
+    cards is a dict of header cards, or None when there is nothing to stamp;
+    reason then says why in a few words (it is shown on the transfer line and
+    counted in the run summary)."""
     site, dt = v.get("site"), v.get("_dt_utc")
-    if not site or dt is None or db is None:
-        return None
+    if db is None:
+        return None, "no database"
+    if dt is None:
+        return None, "no DATE-OBS"
+    if not site:
+        return None, "frame is not at a configured site"
     scfg = next((s for s in cfg["sqm"].get("sites", []) if s["name"] == site), None)
     if not scfg or not scfg.get("sensor"):
-        return None
-    row = db.nearest_reading(scfg["sensor"], dt, cfg["sqm"].get("max_gap_minutes", 15))
+        return None, f"site {site} has no sensor configured"
+    gap = cfg["sqm"].get("max_gap_minutes", 15)
+    row = db.nearest_reading(scfg["sensor"], dt, gap)
     if not row:
-        return None
+        return None, f"no {scfg['sensor']} reading within {gap} min"
     ts, mag = row[0], float(row[1])
     kw = cfg["sqm"].get("keyword", "SQM")
     cards = {kw: (round(mag, 3), "sky brightness mag/arcsec^2 (nwingest)")}
@@ -734,32 +882,120 @@ def lookup_sqm(v, cfg, db):
         cards["SQMSRC"] = (scfg["sensor"], "SQM sensor id")
         cards["SQMTIME"] = (ts.strftime("%Y-%m-%dT%H:%M:%S"), "SQM reading time (UTC)")
         cards["SQMDT"] = (int(abs((dt - ts).total_seconds())), "sec between reading and DATE-OBS")
-    return cards
+    return cards, None
 
 
 # ---------------------------------------------------------------------------
-# Header finalization: FILTER default + SQM stamp, in a single file open
+# Header finalization: FILTER default + SQM stamp. The two are decided
+# independently (a failed SQM lookup never costs the frame its FILTER), then
+# written in one pass by nwingest's own writer rather than astropy's update
+# mode. Update mode walks every HDU before flushing, which fails on a torn
+# copy's trailing block, and its resize path ends with a chmod that raises
+# EPERM over NFS after the new file is already in place (the "Operation not
+# permitted" false failures on the NINA rig).
 # ---------------------------------------------------------------------------
-def finalize_header(path, kind, v, cfg, fits, db):
-    edits = {}
+def plan_header_edits(kind, v, cfg, db):
+    """Cards nwingest adds to a filed frame, and the gaps it could not fill.
+
+    Returns (edits, gaps): edits maps keyword -> (value, comment); gaps is a
+    list of (keyword, reason) for cards that were wanted but unavailable."""
+    edits, gaps = {}, []
     if (kind in ("light", "flat") and v.get("_filter_defaulted")
             and cfg["resolve"]["filter"].get("write_header", True)):
         edits["FILTER"] = (v["filter"], "filled by nwingest (header had none)")
     if kind == "light" and cfg["sqm"].get("enabled"):
-        sqm = lookup_sqm(v, cfg, db)
-        if sqm:
-            edits.update(sqm)
-    if not edits:                       # nothing to write: don't rewrite the file
-        return None
-    try:
+        kw = cfg["sqm"].get("keyword", "SQM")
+        try:
+            cards, why = lookup_sqm(v, cfg, db)
+        except Exception as e:
+            cards, why = None, f"lookup failed: {e}"
+        if cards:
+            edits.update(cards)
+        else:
+            gaps.append((kw, why or "unavailable"))
+    return edits, gaps
+
+
+def write_header_cards(path, edits, fits):
+    """Add or replace primary-header cards in a single-image FITS file.
+
+    In place when the new header fits the blocks the file already reserves for
+    it (the END card is kept in the last reserved block, so the data offset
+    never moves). When the header outgrows that space the file is rewritten
+    through a temp file in the same directory and os.replace, with mode and
+    ownership copied on a best-effort basis. Files with extensions fall back
+    to astropy's update mode. Raises on failure; a failed grow leaves the
+    original untouched."""
+    if not edits:
+        return
+    status, info = fits_structure(path)
+    if status != "ok":
+        raise OSError(f"refusing to write header: {describe_structure(status, info)}")
+    hdr = fits.getheader(path)
+    for k, (val, comment) in edits.items():
+        hdr[k] = (val, comment)
+    reserved = info["hdr_bytes"]
+    body = hdr.tostring(endcard=False, padding=False).encode("ascii")
+    end_card = b"END" + b" " * 77
+    if len(body) + len(end_card) <= reserved:
+        new = body + b" " * (reserved - len(end_card) - len(body)) + end_card
+        with open(path, "r+b") as fh:
+            fh.write(new)
+            fh.flush()
+            os.fsync(fh.fileno())
+        return
+    if info["size"] != info["expected"]:
+        # extensions present: let astropy rewrite the whole thing
         with fits.open(path, mode="update") as hdul:
-            hdr = hdul[0].header
             for k, (val, comment) in edits.items():
-                hdr[k] = (val, comment)
-        return edits
-    except Exception as e:
-        log(f"    warn: header finalize failed on {os.path.basename(path)}: {e}")
-        return None
+                hdul[0].header[k] = (val, comment)
+        return
+    new = hdr.tostring().encode("ascii")            # padded to a block multiple
+    tmp = f"{path}.nwingest-tmp"
+    try:
+        st = os.stat(path)
+        with open(path, "rb") as src, open(tmp, "wb") as dst:
+            dst.write(new)
+            src.seek(reserved)
+            shutil.copyfileobj(src, dst, 1 << 20)
+            dst.flush()
+            os.fsync(dst.fileno())
+        if os.path.getsize(tmp) != len(new) + (info["expected"] - reserved):
+            raise OSError("size mismatch after header rewrite")
+        try:
+            os.chmod(tmp, st.st_mode & 0o7777)
+            os.chown(tmp, st.st_uid, st.st_gid)
+        except OSError:
+            pass                                    # NFS/ACL may refuse; not fatal
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def finalize_header(path, kind, v, cfg, fits, db):
+    """Write nwingest's cards into a filed frame.
+
+    Returns (written, problems): written is the dict of cards now in the
+    header; problems is a list of (keyword-or-step, reason) strings for the
+    caller to log, record and count. Never raises."""
+    edits, problems = plan_header_edits(kind, v, cfg, db)
+    if not edits:
+        return {}, problems
+    for attempt in (1, 2):
+        try:
+            write_header_cards(path, edits, fits)
+            return edits, problems
+        except Exception as e:
+            if attempt == 1:
+                time.sleep(1.0)                     # one retry for a transient NFS hiccup
+                continue
+            problems.append(("header write", f"{e} (lost: {', '.join(edits)})"))
+            warn(f"header write failed on {os.path.basename(path)}: {e}")
+    return {}, problems
 
 
 # ---------------------------------------------------------------------------
@@ -796,7 +1032,7 @@ def _run_one_hook(hk, ctx):
         log(f"    hook '{name}' ok")
     else:
         err = (r.stderr or r.stdout or "").strip().replace("\n", " ")[:200]
-        log(f"    hook '{name}' exited {r.returncode}: {err}")
+        warn(f"hook '{name}' exited {r.returncode}: {err}")
 
 
 def run_hooks(dest, v, cfg):
@@ -814,9 +1050,9 @@ def run_hooks(dest, v, cfg):
         try:
             _run_one_hook(hk, ctx)
         except subprocess.TimeoutExpired:
-            log(f"    hook '{hk.get('name', 'hook')}' timed out")
+            warn(f"hook '{hk.get('name', 'hook')}' timed out")
         except Exception as e:
-            log(f"    hook '{hk.get('name', 'hook')}' error: {e}")
+            warn(f"hook '{hk.get('name', 'hook')}' error: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -877,11 +1113,38 @@ def scan(indir, cfg, require_stable=True):
 
 
 def analyze(path, cfg, fits):
+    """Classify one file: (v, kind, extra). kind is a route key, one of
+    review / quarantine / process, or 'defer' (leave the file where it is this
+    cycle). The structural check runs before the header read so a torn or
+    unfinished copy is never moved into the archive on the strength of a
+    header that happens to parse."""
+    base = {"ext": _ext(path), "_no_date": True}
+    try:
+        status, info = fits_structure(path)
+    except OSError as e:
+        base["_structure_note"] = str(e)
+        return (base, "defer", "unreadable")      # vanished mid-scan; next cycle decides
+    base["_structure"] = status
+    base["_structure_note"] = describe_structure(status, info)
+    if status in ("no-end", "bad-header"):
+        return (base, "quarantine", "unreadable")
+    if status == "trailing":
+        return (base, "quarantine", "torn")
+    if status == "short":
+        try:
+            age = time.time() - os.stat(path).st_mtime
+        except OSError:
+            age = 0.0
+        if age < cfg["watch"].get("truncated_after_s", 600):
+            return (base, "defer", "short")
+        return (base, "quarantine", "truncated")
     try:
         h = fits.getheader(path)
-    except Exception:
-        return ({"ext": _ext(path), "_no_date": True}, "quarantine", "unreadable")
+    except Exception as e:
+        base["_structure_note"] = f"header unreadable: {e}"
+        return (base, "quarantine", "unreadable")
     v = resolve(path, h, cfg)
+    v["_structure"] = status
     kind, extra = classify(path, v, cfg)
     return (v, kind, extra)
 
@@ -903,6 +1166,9 @@ def do_plan(cfg, indir):
     for f in files:
         v, kind, extra = analyze(f, cfg, fits)
         counts[kind] += 1
+        if kind == "defer":
+            passthrough.append((f, f"(left in place: {v.get('_structure_note')})", kind))
+            continue
         if kind in cfg["routes"]:
             groups[_folder_for(kind, extra, v, cfg)].append((f, v, kind))
         else:
@@ -919,13 +1185,49 @@ def do_plan(cfg, indir):
     plans.extend(passthrough)
 
     for src, dest, kind in sorted(plans, key=lambda x: x[2]):
-        rel = os.path.relpath(dest, cfg["destination"]["root"])
+        rel = dest if kind == "defer" else os.path.relpath(dest, cfg["destination"]["root"])
         print(f"  {kind:10} {os.path.basename(src)}\n             -> {rel}")
     log("plan summary: " + ", ".join(f"{k}={counts[k]}" for k in sorted(counts)))
     return 0
 
 
-def process_dir(cfg, fits, db):
+# ---------------------------------------------------------------------------
+# Run statistics: what happened to every file, summarized per cycle and per run
+# ---------------------------------------------------------------------------
+def new_stats():
+    return {"processed": 0, "filed": 0, "review": 0, "process": 0, "deferred": 0,
+            "errors": 0, "write_failed": 0,
+            "quarantine": defaultdict(int),      # reason -> count
+            "gaps": defaultdict(int)}            # keyword -> count of frames filed without it
+
+
+def merge_stats(total, part):
+    for k, val in part.items():
+        if isinstance(val, dict):
+            for kk, n in val.items():
+                total[k][kk] += n
+        else:
+            total[k] += val
+
+
+def summary_line(st):
+    q = ", ".join(f"{k}={n}" for k, n in sorted(st["quarantine"].items()))
+    g = ", ".join(f"{k}={n}" for k, n in sorted(st["gaps"].items()))
+    return (f"filed={st['filed']} review={st['review']} "
+            f"quarantined={sum(st['quarantine'].values())}{f' ({q})' if q else ''} "
+            f"deferred={st['deferred']} errors={st['errors']} | "
+            f"filed without: {g if g else 'nothing'} | header writes failed={st['write_failed']}")
+
+
+def _quiet_gap(reason):
+    """A gap that is expected rather than a failure (no warning line for it)."""
+    return reason.startswith("frame is not at a configured site")
+
+
+def process_dir(cfg, fits, db, stats=None):
+    """One pass over incoming/. Returns the number of files moved; per-file
+    outcomes are accumulated into `stats` (see new_stats) when given."""
+    st = stats if stats is not None else new_stats()
     files = scan(cfg["watch"]["incoming"], cfg, require_stable=True)
     if not files:
         return 0
@@ -933,37 +1235,66 @@ def process_dir(cfg, fits, db):
     kw = cfg["sqm"].get("keyword", "SQM")
     n = 0
     for f in files:
+        name = os.path.basename(f)
         try:
             v, kind, extra = analyze(f, cfg, fits)
+            if kind == "defer":
+                st["deferred"] += 1
+                log(f"  defer      {name}: {v.get('_structure_note')}; left in incoming")
+                continue
             dest = place_live(f, v, kind, extra, cfg)
             action, dest = move(f, dest, cfg["destination"]["on_conflict"])
-            edits = finalize_header(dest, kind, v, cfg, fits, db)
-            if kind in cfg["routes"]:          # hooks fire only on filed science frames
+            written, problems = {}, []
+            if kind in cfg["routes"]:          # science frames only: stamp, then hooks
+                written, problems = finalize_header(dest, kind, v, cfg, fits, db)
                 run_hooks(dest, v, cfg)
-            sqm_val = float(edits[kw][0]) if (edits and kw in edits) else None
+            sqm_val = float(written[kw][0]) if kw in written else None
             reldest = os.path.relpath(dest, root)
             # `action` (rename/copy/skip) is how the file was moved; the recorded
             # status is the disposition -- a filed frame reads "filed", not "rename".
             status = "filed" if action in ("rename", "copy") else action
+            detail = None
+            if kind == "quarantine":
+                detail = v.get("_structure_note") or extra
+            elif problems:
+                detail = "; ".join(f"{k}: {why}" for k, why in problems)
             record({"frame_utc": v.get("_dt_utc"), "kind": kind,
                     "object": v.get("object") or None, "rig": v.get("rig") or None,
                     "filter": (v.get("filter") if kind in ("light", "flat") else None),
-                    "sqm": sqm_val, "dest": reldest, "status": status}, db)
+                    "sqm": sqm_val, "dest": reldest, "status": status,
+                    "detail": (detail or "")[:255] or None}, db)
             note = f"  SQM={sqm_val}" if sqm_val else ""
-            log(f"  {kind:10} {os.path.basename(f)} -> {reldest} [{action}]{note}")
+            if problems:
+                note += "  [" + "; ".join(f"{k}: {why}" for k, why in problems) + "]"
+            log(f"  {kind:10} {name} -> {reldest} [{action}]{note}")
+            if kind == "quarantine":
+                st["quarantine"][extra or "misc"] += 1
+                warn(f"quarantined ({extra}) {name}: {detail}")
+            elif kind in cfg["routes"]:
+                st["filed"] += 1
+            elif kind in st:
+                st[kind] += 1
+            for k, why in problems:
+                if k == "header write":
+                    st["write_failed"] += 1
+                else:
+                    st["gaps"][k] += 1
+                    if not _quiet_gap(why):
+                        warn(f"{os.path.basename(dest)}: filed without {k}: {why}")
             if db is not None and cfg.get("events", {}).get("enabled", True):
-                lvl = "warning" if kind == "quarantine" else "info"
+                lvl = "warning" if (kind == "quarantine" or problems) else "info"
                 sensor = next((s.get("sensor", "") for s in cfg["sqm"].get("sites", [])
                                if s.get("name") == v.get("site")), "")
                 db.log_event("ingest", lvl, "transfer", reldest + note, sensor)
             n += 1
         except Exception as e:
-            log(f"  ERROR {os.path.basename(f)}: {e}")
-            record({"kind": "error", "dest": os.path.basename(f),
+            st["errors"] += 1
+            log(f"  ERROR {name}: {e}", "error")
+            record({"kind": "error", "dest": name,
                     "status": "error", "detail": str(e)[:200]}, db)
             if db is not None and cfg.get("events", {}).get("enabled", True):
-                db.log_event("ingest", "error", "transfer",
-                             f"{os.path.basename(f)}: {str(e)[:180]}")
+                db.log_event("ingest", "error", "transfer", f"{name}: {str(e)[:180]}")
+    st["processed"] += n
     return n
 
 
@@ -972,13 +1303,14 @@ def do_once(cfg):
     db = make_db(cfg)
     if db:
         db.ensure_schema()
+    st = new_stats()
     try:
-        n = process_dir(cfg, fits, db)
+        n = process_dir(cfg, fits, db, st)
     finally:
         if db:
             db.close()
-    log(f"once: processed {n} file(s)")
-    return 0
+    log(f"once: processed {n} file(s); {summary_line(st)}")
+    return 1 if (st["errors"] or st["write_failed"]) else 0
 
 
 def do_watch(cfg):
@@ -992,20 +1324,152 @@ def do_watch(cfg):
     interval = cfg["watch"]["poll_seconds"]
     log(f"watching {cfg['watch']['incoming']} every {interval}s "
         f"(stable={cfg['watch']['stable_seconds']}s)")
+    total = new_stats()
     try:
         while True:
-            process_dir(cfg, fits, db)
+            cycle = new_stats()
+            n = process_dir(cfg, fits, db, cycle)
+            merge_stats(total, cycle)
+            if n:
+                log(f"cycle: {summary_line(cycle)}")
+                log(f"totals since start: {summary_line(total)}")
             if db and ext.get("register"):
                 db.heartbeat(name)
             time.sleep(interval)
     except KeyboardInterrupt:
         log("watch: stopped")
     finally:
+        log(f"watch totals: {summary_line(total)}")
         if db and ext.get("register"):
             db.deregister(name)
         if db:
             db.close()
     return 0
+
+
+def do_backfill(cfg, indir, dry_run=False, hooks=False, recurse=True,
+                quarantine_torn=False):
+    """Add nwingest's missing header cards to frames already in the archive.
+
+    Per FITS file under `indir`: add FILTER (lights and flats without one) and
+    the SQM cards (lights at a configured site with a reading in range) when
+    absent. Files are never moved or renamed, and a file that already has
+    everything is left alone, so a second run changes nothing. Torn, short or
+    END-less files are listed for re-copy and never touched. A missing WCS is
+    reported, not produced: nwingest has no solver, the capture device or a
+    hook supplies it (--hooks reruns the configured hooks on each file that
+    was updated or is still missing something). With quarantine_torn the
+    torn, short or END-less files are moved (never deleted) to
+    quarantine/<reason>/ under the archive root, keeping their names, so a
+    fresh copy can take their place. With dry_run nothing is written or moved
+    anywhere: no header, no database rows, no hooks."""
+    fits = _need_astropy()
+    db = make_db(cfg)
+    if db and not dry_run:
+        db.ensure_schema()
+    indir = os.path.abspath(indir)
+    files = scan(indir, cfg, require_stable=False)
+    if not recurse:
+        files = [f for f in files if os.path.dirname(f) == indir]
+    if not files:
+        log(f"backfill: no FITS under {indir}")
+        return 0
+    root = cfg["destination"]["root"]
+    kw = cfg["sqm"].get("keyword", "SQM")
+    verb = "would add" if dry_run else "added"
+    st = defaultdict(int)
+    recopy = []
+    log(f"backfill{' (dry run, nothing will be written)' if dry_run else ''}: "
+        f"{len(files)} file(s) under {indir}")
+    try:
+        for f in files:
+            rel = os.path.relpath(f, indir)
+            st["scanned"] += 1
+            try:
+                status, info = fits_structure(f)
+                if status != "ok":
+                    st["needs_recopy"] += 1
+                    why = describe_structure(status, info)
+                    reason = {"trailing": "torn", "short": "truncated"}.get(status, "unreadable")
+                    if quarantine_torn and not dry_run:
+                        qdest = os.path.join(_folder_for("quarantine", reason, {}, cfg),
+                                             os.path.basename(f))
+                        _action, qdest = move(f, qdest, cfg["destination"]["on_conflict"])
+                        qrel = os.path.relpath(qdest, root)
+                        record({"kind": "quarantine", "dest": qrel, "status": "backfill",
+                                "detail": why[:255]}, db)
+                        if db is not None and cfg.get("events", {}).get("enabled", True):
+                            db.log_event("ingest", "warning", "backfill", f"{qrel}: {why}")
+                        warn(f"MOVED     {rel} -> {qrel}: {why}")
+                        st["quarantined"] += 1
+                    else:
+                        recopy.append(rel)
+                        tail = f" (would move to quarantine/{reason}/)" if quarantine_torn else ""
+                        warn(f"RE-COPY   {rel}: {why}{tail}")
+                    continue
+                h = fits.getheader(f)
+                v = resolve(f, h, cfg)
+                kind = v["type"]
+                if kind not in cfg["routes"]:
+                    st["skipped"] += 1
+                    continue
+                edits, gaps = {}, []
+                if (kind in ("light", "flat") and v.get("_filter_defaulted")
+                        and cfg["resolve"]["filter"].get("write_header", True)):
+                    edits["FILTER"] = (v["filter"], "filled by nwingest (header had none)")
+                if kind == "light" and cfg["sqm"].get("enabled") and kw not in h:
+                    try:
+                        cards, why = lookup_sqm(v, cfg, db)
+                    except Exception as e:
+                        cards, why = None, f"lookup failed: {e}"
+                    if cards:
+                        edits.update(cards)
+                    else:
+                        gaps.append((kw, why or "unavailable"))
+                        st["sqm_unavailable"] += 1
+                if kind == "light" and not has_wcs(h):
+                    gaps.append(("WCS", "absent; nwingest does not solve (re-copy from "
+                                        "the capture device, or run a solver hook)"))
+                    st["wcs_missing"] += 1
+                if not edits and not gaps:
+                    st["complete"] += 1
+                    continue
+                if edits and not dry_run:
+                    write_header_cards(f, edits, fits)
+                    sqm_val = float(edits[kw][0]) if kw in edits else None
+                    dest = os.path.relpath(f, root) if f.startswith(root + os.sep) else f
+                    record({"frame_utc": v.get("_dt_utc"), "kind": kind,
+                            "object": v.get("object") or None, "rig": v.get("rig") or None,
+                            "filter": (v.get("filter") if kind in ("light", "flat") else None),
+                            "sqm": sqm_val, "dest": dest, "status": "backfill",
+                            "detail": ("added " + ", ".join(edits))[:255]}, db)
+                    if db is not None and cfg.get("events", {}).get("enabled", True):
+                        db.log_event("ingest", "info", "backfill",
+                                     f"{dest}: added {', '.join(edits)}")
+                if edits:
+                    st["would_update" if dry_run else "updated"] += 1
+                note = ""
+                if gaps:
+                    note = "  [missing: " + "; ".join(f"{k}: {why}" for k, why in gaps) + "]"
+                log(f"  {verb:9} {rel}: {', '.join(edits) if edits else '-'}{note}")
+                if hooks and not dry_run:
+                    run_hooks(f, v, cfg)
+            except Exception as e:
+                st["errors"] += 1
+                log(f"  ERROR {rel}: {e}", "error")
+    finally:
+        if db:
+            db.close()
+    upd = "would_update" if dry_run else "updated"
+    log(f"backfill summary: scanned={st['scanned']} complete={st['complete']} "
+        f"{upd}={st[upd]} needs_recopy={st['needs_recopy']} quarantined={st['quarantined']} "
+        f"wcs_missing={st['wcs_missing']} sqm_unavailable={st['sqm_unavailable']} "
+        f"not_science={st['skipped']} errors={st['errors']}")
+    if recopy:
+        log("files needing re-copy from the capture device (not modified):")
+        for r in recopy:
+            log(f"    {r}")
+    return 1 if st["errors"] else 0
 
 
 def main():
@@ -1020,15 +1484,32 @@ def main():
     p_plan.add_argument("dir", nargs="?", default=None, help="directory to scan (default: watch.incoming)")
     sub.add_parser("once", help="process the incoming directory once, then exit")
     sub.add_parser("watch", help="poll the incoming directory forever")
+    p_bf = sub.add_parser("backfill", help="add missing nwingest header cards (FILTER, SQM) "
+                                          "to frames already in the archive; never moves files")
+    p_bf.add_argument("dir", help="directory to scan (recursively)")
+    p_bf.add_argument("--dry-run", action="store_true",
+                      help="list what would change and write nothing (no header, DB, hooks)")
+    p_bf.add_argument("--hooks", action="store_true",
+                      help="also rerun the configured hooks on each file that was updated "
+                           "or is still missing something (e.g. a solver hook for WCS)")
+    p_bf.add_argument("--quarantine-torn", action="store_true",
+                      help="move torn, truncated or END-less files out of the archive into "
+                           "quarantine/<reason>/ (keeping their names) so a fresh copy from "
+                           "the capture device can take their place; never deletes")
+    p_bf.add_argument("--no-recurse", action="store_true", help="only the directory itself")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
+    configure_logging(cfg)
     if args.mode == "plan":
         return do_plan(cfg, args.dir or cfg["watch"]["incoming"])
     if args.mode == "once":
         return do_once(cfg)
     if args.mode == "watch":
         return do_watch(cfg)
+    if args.mode == "backfill":
+        return do_backfill(cfg, args.dir, dry_run=args.dry_run, hooks=args.hooks,
+                           recurse=not args.no_recurse, quarantine_torn=args.quarantine_torn)
     return 1
 
 
