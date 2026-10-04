@@ -19,3 +19,6 @@ dist/
 
 # built Debian package
 nightwatcher-ingest_*_all.deb
+
+# Local investigation records (RCAs with journal excerpts, live configs, host names)
+rca/
