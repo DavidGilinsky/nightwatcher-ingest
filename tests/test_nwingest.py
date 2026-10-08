@@ -6,8 +6,8 @@
 #             (torn and short copies), independent FILTER/SQM header steps,
 #             the own header writer, run summaries, and the backfill mode.
 #  Created  : 2026-10-04
-#  Modified : 2026-10-04
-#  Version  : 0.2.0
+#  Modified : 2026-10-07
+#  Version  : 0.3.0
 #  License  : GPL-3.0-or-later
 # ============================================================================
 """Run with:  python3 -m pytest -q tests/   or   python3 -m unittest -v tests.test_nwingest
@@ -61,7 +61,7 @@ def write_frame(path, imagetyp="Light", exptime=120.0, with_filter=False,
     h["SITELAT"] = 32.3032
     h["SITELONG"] = -110.986
     if with_filter:
-        h["FILTER"] = "CLEAR"
+        h["FILTER"] = with_filter if isinstance(with_filter, str) else "CLEAR"
     for k, val in (extra_cards or {}).items():
         h[k] = val
     hdu.writeto(path, overwrite=True)
@@ -373,6 +373,104 @@ class BackfillTests(unittest.TestCase):
         self.assertIn("quarantined=1", out)
         kinds = [r["kind"] for r in db.ingest]
         self.assertIn("quarantine", kinds)
+
+
+ASIAIR_LIGHT = "Light_IC 1805_60.0s_Bin1_4400MC_gain136_20261007-174102_242deg_0.0C_F_ALP_T_5nm_0001.fit"
+ASIAIR_FLAT = "Flat_1.0s_Bin1_4400MC_gain136_20261007-174812_242deg_0.0C_F_ALP_T_5nm_0001.fit"
+ASIAIR_PLAIN = "Light_IC 1805_60.0s_Bin1_4400MC_gain136_20261007-044639_241deg_-0.1C_0398.fit"
+
+
+class FilterFromFilenameTests(unittest.TestCase):
+    """The manual filter drawer: a token the ASIAir puts in the filename."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="nwtest-")
+        self.cfg = make_cfg(self.tmp)
+        self.cfg["sqm"]["enabled"] = False
+        self.cfg["resolve"]["filter"]["from_filename"]["enabled"] = True
+        self.cfg["resolve"]["filter"]["from_filename"]["aliases"] = {"alp_t_5nm": "ALP-T-5nm"}
+        self.inc = self.cfg["watch"]["incoming"]
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def test_rule_parses_the_asiair_layout(self):
+        f = nwingest.filter_from_filename
+        self.assertEqual(f(ASIAIR_LIGHT, self.cfg), "ALP-T-5nm")       # alias, any case
+        self.assertEqual(f(ASIAIR_FLAT, self.cfg), "ALP-T-5nm")
+        self.assertIsNone(f(ASIAIR_PLAIN, self.cfg))                   # no token
+        self.assertEqual(f("Light_M31_60.0s_Bin1_4400MC_gain136_20261007-010203_0deg_0.0C_F_Ha_0012.fit", self.cfg),
+                         "Ha")                                         # unaliased: as typed
+        self.assertEqual(f("Light_M31_60.0s_Bin1_4400MC_gain136_20261007-010203_0deg_0.0C_f_sii_0012.fits", self.cfg),
+                         "sii")                                        # prefix is case-insensitive
+        self.assertIsNone(f("Light_M31_60.0s_Bin1_4400MC_gain136_20261007-010203_0deg_0.0C_note_0012.fit", self.cfg))
+        self.cfg["resolve"]["filter"]["from_filename"]["enabled"] = False
+        self.assertIsNone(f(ASIAIR_LIGHT, self.cfg))                   # off by default
+
+    def test_light_with_token_is_filed_by_filter_with_cards(self):
+        write_frame(os.path.join(self.inc, ASIAIR_LIGHT))
+        db = FakeDb()
+        n, st, out = run_once(self.cfg, db)
+        self.assertEqual(n, 1)
+        f = glob.glob(os.path.join(self.tmp, "lights", "*", "*", "*", "ALP-T-5nm", "*.fits"))
+        self.assertEqual(len(f), 1)
+        self.assertIn("_ALP-T-5nm_", os.path.basename(f[0]))
+        h = fits.getheader(f[0])
+        self.assertEqual(h["FILTER"], "ALP-T-5nm")
+        self.assertIn("filename token", h.comments["FILTER"])
+        self.assertEqual(h["SRCFILE"], ASIAIR_LIGHT)
+        self.assertEqual(db.ingest[0]["filter"], "ALP-T-5nm")
+        self.assertEqual(st["filed"], 1)
+
+    def test_flat_with_token_is_filed_under_the_filter(self):
+        write_frame(os.path.join(self.inc, ASIAIR_FLAT), imagetyp="Flat", exptime=1.0)
+        n, st, out = run_once(self.cfg, FakeDb())
+        f = glob.glob(os.path.join(self.tmp, "calibration", "flat", "*", "ALP-T-5nm", "*", "*.fits"))
+        self.assertEqual(len(f), 1)
+        self.assertEqual(fits.getheader(f[0])["FILTER"], "ALP-T-5nm")
+
+    def test_no_token_stays_clear(self):
+        write_frame(os.path.join(self.inc, ASIAIR_PLAIN))
+        n, st, out = run_once(self.cfg, FakeDb())
+        f = glob.glob(os.path.join(self.tmp, "lights", "*", "*", "*", "CLEAR", "*.fits"))
+        self.assertEqual(len(f), 1)
+        h = fits.getheader(f[0])
+        self.assertEqual(h["FILTER"], "CLEAR")
+        self.assertIn("header had none", h.comments["FILTER"])
+        self.assertEqual(h["SRCFILE"], ASIAIR_PLAIN)
+
+    def test_header_filter_wins_over_token_with_a_warning(self):
+        write_frame(os.path.join(self.inc, ASIAIR_LIGHT), with_filter="Ha")
+        n, st, out = run_once(self.cfg, FakeDb())
+        f = glob.glob(os.path.join(self.tmp, "lights", "*", "*", "*", "Ha", "*.fits"))
+        self.assertEqual(len(f), 1)
+        h = fits.getheader(f[0])
+        self.assertEqual(h["FILTER"], "Ha")
+        self.assertEqual(h.comments["FILTER"], "")                      # the capture app's card, untouched
+        self.assertIn("header FILTER='Ha' but the filename token says 'ALP-T-5nm'", out)
+
+    def test_plan_shows_the_resolved_filter(self):
+        write_frame(os.path.join(self.inc, ASIAIR_LIGHT))
+        out = io.StringIO()
+        with redirect_stdout(out):
+            nwingest.do_plan(self.cfg, self.inc)
+        self.assertIn("/ALP-T-5nm/", out.getvalue())
+        self.assertTrue(os.path.exists(os.path.join(self.inc, ASIAIR_LIGHT)))   # plan moves nothing
+
+    def test_backfill_rederives_filter_from_the_source_card(self):
+        arch = os.path.join(self.tmp, "lights", "IC1805", "ASI4400", "2026-10-06", "CLEAR")
+        os.makedirs(arch)
+        p = write_frame(os.path.join(arch, "IC1805_filed_0001.fits"), extra_cards={"SRCFILE": ASIAIR_LIGHT})
+        db = FakeDb()
+        with unittest.mock.patch.object(nwingest, "make_db", lambda cfg: db):
+            out = io.StringIO()
+            with redirect_stdout(out):
+                rc = nwingest.do_backfill(self.cfg, arch)
+        self.assertEqual(rc, 0)
+        h = fits.getheader(p)
+        self.assertEqual(h["FILTER"], "ALP-T-5nm")
+        self.assertIn("filename token", h.comments["FILTER"])
+        self.assertIn("added FILTER", db.ingest[0]["detail"])
 
 
 import unittest.mock  # noqa: E402  (used by BackfillTests)

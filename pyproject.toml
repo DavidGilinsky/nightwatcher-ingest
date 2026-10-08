@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nightwatcher-ingest"
-version = "0.2.0"
+version = "0.3.0"
 description = "Config-driven FITS ingest: watch a directory, classify by header, rename to a standard, and file into an archive tree."
 readme = "README.md"
 requires-python = ">=3.9"

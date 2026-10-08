@@ -7,8 +7,8 @@
 #             an archive tree. Optional SQM stamping, external hooks, and
 #             NightWatcher2 web UI registration.
 #  Created  : 2026-07-21
-#  Modified : 2026-10-04
-#  Version  : 0.2.0
+#  Modified : 2026-10-07
+#  Version  : 0.3.0
 #  License  : GPL-3.0-or-later
 # ============================================================================
 """nwingest: watch, classify, rename, and file FITS frames by configuration.
@@ -21,7 +21,10 @@ Modes:
             (FILTER, SQM); --dry-run lists what would change and writes nothing
 
 Everything is header-driven: the paths and filenames the capture apps produce
-are never trusted, only the FITS header. See nwingest.example.yaml.
+are never trusted, only the FITS header. The one deliberate exception is
+resolve.filter.from_filename, for a capture app that cannot record a manually
+swapped filter in the header (the ASIAir with a filter drawer) and can only put
+a typed token in the filename. See nwingest.example.yaml.
 """
 
 from __future__ import annotations
@@ -41,7 +44,7 @@ from collections import defaultdict
 from copy import deepcopy
 from datetime import datetime, timedelta
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 try:
     import yaml
@@ -102,7 +105,25 @@ DEFAULTS = {
         "night": {"mode": "noon-to-noon", "utc_offset_hours": -7},
         "object": {"messier_alias": True,
                    "compact_catalogs": ["NGC", "IC", "M", "UGC", "PGC", "AGC", "ARP", "MRK", "HCG"]},
-        "filter": {"default": "CLEAR", "write_header": True},
+        "filter": {
+            "default": "CLEAR",
+            "write_header": True,
+            # Read the filter from a token in the capture filename when the
+            # header carries none. Off by default; see nwingest.example.yaml.
+            "from_filename": {
+                "enabled": False,
+                # The ASIAir puts its custom text between the temperature field
+                # and the 4-digit sequence number, on lights and flats alike:
+                #   ..._gain136_20261007-174102_242deg_0.0C_F_ALP_T_5nm_0001.fit
+                # The capture group is the raw filter name; F_ is the convention.
+                "pattern": r"_-?\d+(?:\.\d+)?C_F_(?P<filter>.+?)_\d{4}\.fits?$",
+                "aliases": {},          # raw token (any case) -> FILTER value
+            },
+        },
+        # Header card that records the capture app's original filename on each
+        # filed science frame (null = don't). Lets `backfill` re-derive FILTER
+        # from the token later, since the archive name no longer carries it.
+        "source_card": "SRCFILE",
         "gain_keywords": ["GAIN", "GAINRAW"],
         "sequence": {"width": 4},
     },
@@ -512,6 +533,40 @@ def norm_object(h, cfg):
     return re.sub(r"[^\w+-]", "_", obj)
 
 
+_bad_filter_patterns = set()
+
+
+def filter_from_filename(name, cfg):
+    """Filter name encoded as a token in the capture filename, or None.
+
+    `name` is a filename (a path is reduced to its basename). The configured
+    regex must capture the raw token, as the group named `filter` or the first
+    group; it is matched case-insensitively. The alias table maps the raw
+    token (any case) to the FILTER value; an unaliased token is used as typed,
+    reduced to characters that are safe in a path."""
+    fc = cfg["resolve"]["filter"].get("from_filename") or {}
+    pat = fc.get("pattern")
+    if not fc.get("enabled") or not pat:
+        return None
+    try:
+        m = re.search(pat, os.path.basename(str(name)), re.IGNORECASE)
+    except re.error as e:
+        if pat not in _bad_filter_patterns:
+            _bad_filter_patterns.add(pat)
+            warn(f"resolve.filter.from_filename.pattern is not a valid regex: {e}")
+        return None
+    if not m:
+        return None
+    raw = m.groupdict().get("filter") or (m.group(1) if m.groups() else "")
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    for k, val in (fc.get("aliases") or {}).items():
+        if str(k).lower() == raw.lower():
+            return str(val)
+    return re.sub(r"[^\w+.-]", "_", raw)
+
+
 def _parse_coord(val):
     """Decimal degrees from a numeric or sexagesimal FITS coordinate value."""
     if val is None:
@@ -570,13 +625,20 @@ def resolve(path, h, cfg):
     off = cfg["resolve"]["night"]["utc_offset_hours"]
 
     raw_filter = str(hget(h, "FILTER", default="") or "").strip()
+    token = filter_from_filename(path, cfg)
+    if raw_filter:
+        filt, filter_source = raw_filter, "header"
+    elif token:
+        filt, filter_source = token, "filename"
+    else:
+        filt, filter_source = cfg["resolve"]["filter"]["default"], "default"
 
     return {
         "type": frame_type(h),
         "object": norm_object(h, cfg),
         "camera": camera,
         "rig": rig_of(camera, focal, cfg),
-        "filter": raw_filter or cfg["resolve"]["filter"]["default"],
+        "filter": filt,
         "night": night_of(dt, off) if dt else "",
         "utc": dt.strftime("%Y-%m-%dT%H%M%S") if dt else "",
         "exp": fmt_exp(exp),
@@ -588,7 +650,11 @@ def resolve(path, h, cfg):
         "ext": _ext(path),
         "_exp_num": exp,
         "_no_date": dt is None,
-        "_filter_defaulted": not raw_filter,
+        "_filter_defaulted": not raw_filter,      # header had none: a FILTER card is written
+        "_filter_source": filter_source,          # header | filename | default
+        # header and filename disagree: the header wins, the caller warns
+        "_filter_conflict": (raw_filter, token) if (raw_filter and token and token != raw_filter) else None,
+        "_srcname": os.path.basename(path),
         "_dt_utc": dt,
     }
 
@@ -894,15 +960,27 @@ def lookup_sqm(v, cfg, db):
 # EPERM over NFS after the new file is already in place (the "Operation not
 # permitted" false failures on the NINA rig).
 # ---------------------------------------------------------------------------
-def plan_header_edits(kind, v, cfg, db):
+FILTER_COMMENTS = {
+    "filename": "from capture filename token (nwingest)",
+    "default": "filled by nwingest (header had none)",
+}
+
+
+def plan_header_edits(kind, v, cfg, db, src_name=None):
     """Cards nwingest adds to a filed frame, and the gaps it could not fill.
 
     Returns (edits, gaps): edits maps keyword -> (value, comment); gaps is a
-    list of (keyword, reason) for cards that were wanted but unavailable."""
+    list of (keyword, reason) for cards that were wanted but unavailable.
+    `src_name` is the capture app's filename, recorded in the source card at
+    ingest (not on a backfill, where the original name is already gone)."""
     edits, gaps = {}, []
     if (kind in ("light", "flat") and v.get("_filter_defaulted")
             and cfg["resolve"]["filter"].get("write_header", True)):
-        edits["FILTER"] = (v["filter"], "filled by nwingest (header had none)")
+        edits["FILTER"] = (v["filter"], FILTER_COMMENTS.get(v.get("_filter_source"),
+                                                              FILTER_COMMENTS["default"]))
+    card = cfg["resolve"].get("source_card")
+    if card and src_name and kind in cfg["routes"]:
+        edits[str(card).upper()] = (src_name, "original filename as captured")
     if kind == "light" and cfg["sqm"].get("enabled"):
         kw = cfg["sqm"].get("keyword", "SQM")
         try:
@@ -976,13 +1054,13 @@ def write_header_cards(path, edits, fits):
         raise
 
 
-def finalize_header(path, kind, v, cfg, fits, db):
+def finalize_header(path, kind, v, cfg, fits, db, src_name=None):
     """Write nwingest's cards into a filed frame.
 
     Returns (written, problems): written is the dict of cards now in the
     header; problems is a list of (keyword-or-step, reason) strings for the
     caller to log, record and count. Never raises."""
-    edits, problems = plan_header_edits(kind, v, cfg, db)
+    edits, problems = plan_header_edits(kind, v, cfg, db, src_name=src_name)
     if not edits:
         return {}, problems
     for attempt in (1, 2):
@@ -1145,6 +1223,10 @@ def analyze(path, cfg, fits):
         return (base, "quarantine", "unreadable")
     v = resolve(path, h, cfg)
     v["_structure"] = status
+    if v.get("_filter_conflict"):
+        hdr_f, tok = v["_filter_conflict"]
+        warn(f"{os.path.basename(path)}: header FILTER='{hdr_f}' but the filename token "
+             f"says '{tok}'; keeping the header value")
     kind, extra = classify(path, v, cfg)
     return (v, kind, extra)
 
@@ -1246,7 +1328,7 @@ def process_dir(cfg, fits, db, stats=None):
             action, dest = move(f, dest, cfg["destination"]["on_conflict"])
             written, problems = {}, []
             if kind in cfg["routes"]:          # science frames only: stamp, then hooks
-                written, problems = finalize_header(dest, kind, v, cfg, fits, db)
+                written, problems = finalize_header(dest, kind, v, cfg, fits, db, src_name=name)
                 run_hooks(dest, v, cfg)
             sqm_val = float(written[kw][0]) if kw in written else None
             reldest = os.path.relpath(dest, root)
@@ -1416,7 +1498,14 @@ def do_backfill(cfg, indir, dry_run=False, hooks=False, recurse=True,
                 edits, gaps = {}, []
                 if (kind in ("light", "flat") and v.get("_filter_defaulted")
                         and cfg["resolve"]["filter"].get("write_header", True)):
-                    edits["FILTER"] = (v["filter"], "filled by nwingest (header had none)")
+                    # The archive name no longer carries the capture app's token;
+                    # the source card does, when ingest wrote one.
+                    src_card = str(cfg["resolve"].get("source_card") or "").upper()
+                    token = filter_from_filename(h.get(src_card, ""), cfg) if src_card else None
+                    if token:
+                        edits["FILTER"] = (token, FILTER_COMMENTS["filename"])
+                    else:
+                        edits["FILTER"] = (v["filter"], FILTER_COMMENTS["default"])
                 if kind == "light" and cfg["sqm"].get("enabled") and kw not in h:
                     try:
                         cards, why = lookup_sqm(v, cfg, db)

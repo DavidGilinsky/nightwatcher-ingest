@@ -103,9 +103,11 @@ The config controls everything (see the comments in
    `GAIN` or `GAINRAW`, local noon-to-noon nights, Messier aliases, and `CLEAR`
    as the default filter when a frame carries none). A light or flat whose
    header has no `FILTER` also gets `FILTER=CLEAR` written into it, so WBPP
-   groups it correctly.
-5. **Hooks** (below).
-6. **SQM stamping and the web UI tab** (below).
+   groups it correctly. Every filed science frame also gets a `SRCFILE` card
+   with the capture app's original filename.
+5. **A manual filter drawer** (`resolve.filter.from_filename`, below).
+6. **Hooks** (below).
+7. **SQM stamping and the web UI tab** (below).
 
 Templates use `{variable}` placeholders. Available variables:
 `{object} {type} {rig} {camera} {night} {filter} {utc} {seq} {exp} {gain}
@@ -137,6 +139,41 @@ Over NFS it polls rather than using inotify, because an NFS client cannot see
 writes made by other hosts. It only touches a file once it has been size-stable
 for a few seconds, which covers both an app writing directly and a network copy
 landing.
+
+## Manual filter drawer: the filter from the capture filename
+
+An ASIAir with a filter drawer instead of an EFW has no way to put the filter
+in the header. It does let you type a custom name that it inserts into every
+filename, between the temperature field and the sequence number, on lights and
+flats alike:
+
+```
+Light_IC 1805_60.0s_Bin1_4400MC_gain136_20261007-174102_242deg_0.0C_F_ALP_T_5nm_0001.fit
+Flat_1.0s_Bin1_4400MC_gain136_20261007-174812_242deg_0.0C_F_ALP_T_5nm_0001.fit
+```
+
+Type `F_<name>` there (the ASIAir's field accepts letters, digits and
+underscores) and turn on `resolve.filter.from_filename`:
+
+```yaml
+resolve:
+  filter:
+    from_filename:
+      enabled: true
+      pattern: '_-?\d+(?:\.\d+)?C_F_(?P<filter>.+?)_\d{4}\.fits?$'
+      aliases:
+        ALP_T_5nm: ALP-T-5nm     # raw token (any case) -> FILTER value and folder name
+```
+
+The rules, in order: a `FILTER` card in the header always wins, so an EFW rig
+is unaffected; otherwise the token is used; otherwise the frame is `CLEAR` as
+before. A token with an alias becomes the alias (keep underscores out of the
+result, since nwingest's own filenames are underscore-delimited); one without is
+used as typed. If the header and the token disagree, the header value is kept
+and a warning names the file. The result drives the `{filter}` folder and
+filename and is written as `FILTER` with a comment saying it came from the
+filename, so WBPP matches the flats. `backfill` can re-derive `FILTER` for a
+frame that lacks one from its `SRCFILE` card.
 
 ## Backfill: repairing frames that were filed incomplete
 

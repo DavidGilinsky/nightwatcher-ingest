@@ -65,6 +65,21 @@ resolve:
   filter:
     default: "CLEAR"          # filter name used when the header has none
     write_header: true        # also write FILTER=<default> into lights/flats that lacked it
+    # Manual filter drawer (no EFW): the capture app cannot put the filter in the
+    # header, but the ASIAir inserts a typed custom name into every filename,
+    # between the temperature field and the sequence number, on lights and flats:
+    #   Light_IC 1805_60.0s_Bin1_4400MC_gain136_20261007-174102_242deg_0.0C_F_ALP_T_5nm_0001.fit
+    # Type F_<name> there and enable this. A FILTER card in the header always
+    # wins; the token is used only when the header has none; no token = default.
+    from_filename:
+      enabled: false
+      pattern: '_-?\d+(?:\.\d+)?C_F_(?P<filter>.+?)_\d{4}\.fits?$'   # group = raw token
+      aliases:                # raw token (any case) -> FILTER value / folder name.
+        ALP_T_5nm: ALP-T-5nm  # keep underscores out of the result; nwingest's own
+                              # filenames are underscore-delimited
+  # Card recording the capture app's original filename on every filed science
+  # frame (null = don't). `backfill` uses it to re-derive FILTER from the token.
+  source_card: SRCFILE
   gain_keywords: [GAIN, GAINRAW]   # tried in order; TheSkyX writes GAINRAW
   sequence:
     width: 4                  # zero-padded per-folder sequence, e.g. 0007
