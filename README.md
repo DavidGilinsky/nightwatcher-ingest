@@ -9,8 +9,10 @@ NightWatcher2 web UI.
 
 It is header-driven on purpose. Three capture apps (NINA, TheSkyX, an ASIair)
 produce three different folder layouts and filenames, but they all write a sane
-FITS header, so the header is the only thing trusted. Nothing about the naming
-scheme is hardcoded; it all lives in one YAML file.
+FITS header, so the header is the only thing trusted. The one deliberate
+exception is a filter token in the ASIair's filename for a manual filter drawer,
+which the ASIair cannot record anywhere else (see *Manual filter drawer*).
+Nothing about the naming scheme is hardcoded; it all lives in one YAML file.
 
 It works as a plain FITS organizer with no SQM and no NightWatcher at all. The
 sky-brightness stamping and the web UI tab are optional extras that light up
@@ -174,6 +176,38 @@ and a warning names the file. The result drives the `{filter}` folder and
 filename and is written as `FILTER` with a comment saying it came from the
 filename, so WBPP matches the flats. `backfill` can re-derive `FILTER` for a
 frame that lacks one from its `SRCFILE` card.
+
+### At the telescope
+
+1. Load the drawer, then type the token in the ASIair app's custom file-name
+   field: `F_` plus the name you want to see, for example `F_ALP_T_5nm`. The
+   field takes letters, digits and underscores only; a hyphen is refused.
+2. Shoot lights and flats as usual. The ASIair appends the token to every frame
+   it saves while the field is set; AirWatcher copies the names through
+   unchanged.
+3. Clear the field when the drawer comes out. The ASIair keeps it set until you
+   do, and frames shot without the drawer would be filed under that filter.
+
+What lands, for the example above with the alias `ALP_T_5nm: ALP-T-5nm`:
+
+```
+lights/IC1805/WO-UC-108-ASI4400/2026-10-07/ALP-T-5nm/IC1805_2026-10-08T010829Z_0001_WO-UC-108-ASI4400_ALP-T-5nm_30s_g136_o15_bin1_0C.fits
+calibration/flat/WO-UC-108-ASI4400/ALP-T-5nm/2026-10-07/Flat_2026-10-08T010109Z_0001_WO-UC-108-ASI4400_ALP-T-5nm_g136_o15_bin1.fits
+```
+
+with these cards in each header:
+
+```
+FILTER  = 'ALP-T-5nm'          / from capture filename token (nwingest)
+SRCFILE = 'Light_IC 1805_30.0s_Bin1_4400MC_gain136_20261007-180900_242deg_0.0C_F_ALP_T_5nm_0001.fit' / original filename as captured
+```
+
+Two things the token does not change: a light shorter than
+`exclude_lights.min_exposure_s` still goes to `review/short`, and a dark or bias
+ignores the token, since the filter is irrelevant to them. To add a filter, add
+an alias (or just type a new token; it is used as typed). Changing an alias
+later affects new frames only; frames already filed keep their folder and
+`FILTER` card.
 
 ## Backfill: repairing frames that were filed incomplete
 
